@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multi-Cloud Scheduler Dashboard</title>
+<link rel="stylesheet" href="static/css/style.css"> 
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div style="display:flex;align-items:center;gap:12px">
+    <div class="logo">scheduler<span>/</span>v1</div>
+    <div style="display:flex;align-items:center;gap:6px">
+      <div class="live-dot"></div>
+      <span style="font-family:var(--font-mono);font-size:11px;color:var(--accent2)">LIVE</span>
+    </div>
+  </div>
+  <div class="hdr-meta">
+    <span>3 clouds</span>
+    <span style="color:var(--border2)">|</span>
+    <span>tensile-method-459009-k2.spot_prices</span>
+    <span style="color:var(--border2)">|</span>
+    <span class="clock" id="clock">--:--:-- UTC</span>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- Stat cards -->
+  <div class="stats-row">
+    <div class="stat-card aws">
+      <div class="stat-label">AWS spot / hr</div>
+      <div class="stat-value" id="aws-price">$—</div>
+      <div class="stat-sub">g4dn.xlarge · us-east-1a</div>
+      <div class="stat-delta" id="aws-delta">loading...</div>
+    </div>
+    <div class="stat-card gcp">
+      <div class="stat-label">GCP preemptible / hr</div>
+      <div class="stat-value" id="gcp-price">$—</div>
+      <div class="stat-sub">g2-standard-4 · us-central1</div>
+      <div class="stat-delta" id="gcp-delta">loading...</div>
+    </div>
+    <div class="stat-card azure">
+      <div class="stat-label">Azure spot / hr</div>
+      <div class="stat-value" id="azure-price">$—</div>
+      <div class="stat-sub">NC4as_T4_v3 · eastus</div>
+      <div class="stat-delta" id="azure-delta">loading...</div>
+    </div>
+    <div class="stat-card savings">
+      <div class="stat-label">Total rows collected</div>
+      <div class="stat-value" id="ckpt-total">—</div>
+      <div class="stat-sub">preemption events: <span id="ckpt-emergency">—</span></div>
+      <div class="stat-delta" style="color:var(--accent)">Phase 1 data pipeline</div>
+    </div>
+  </div>
+
+  <!-- Price chart -->
+  <div class="panel">
+    <div class="panel-header">
+      <div class="panel-title">Spot Price History</div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <div class="chart-legend">
+          <div class="legend-item"><div class="legend-dot" style="background:var(--aws)"></div>AWS</div>
+          <div class="legend-item"><div class="legend-dot" style="background:var(--gcp)"></div>GCP</div>
+          <div class="legend-item"><div class="legend-dot" style="background:var(--azure)"></div>Azure</div>
+        </div>
+        <div class="badge badge-mock" id="api-status-badge" title="Checking API...">MOCK DATA</div>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="chart-wrap"><canvas id="price-chart"></canvas></div>
+      <div class="chart-numerics">
+        <div class="num-card aws">
+          <div class="num-cloud">AWS · g4dn.xlarge</div>
+          <div class="num-current" id="aws-current">$—</div>
+          <div class="num-stats">
+            <div class="num-stat">Min <span id="aws-min">—</span></div>
+            <div class="num-stat">Max <span id="aws-max">—</span></div>
+            <div class="num-stat">Avg <span id="aws-avg">—</span></div>
+          </div>
+        </div>
+        <div class="num-card gcp">
+          <div class="num-cloud">GCP · g2-standard-4</div>
+          <div class="num-current" id="gcp-current">$—</div>
+          <div class="num-stats">
+            <div class="num-stat">Min <span id="gcp-min">—</span></div>
+            <div class="num-stat">Max <span id="gcp-max">—</span></div>
+            <div class="num-stat">Avg <span id="gcp-avg">—</span></div>
+          </div>
+        </div>
+        <div class="num-card azure">
+          <div class="num-cloud">Azure · NC4as_T4_v3</div>
+          <div class="num-current" id="azure-current">$—</div>
+          <div class="num-stats">
+            <div class="num-stat">Min <span id="azure-min">—</span></div>
+            <div class="num-stat">Max <span id="azure-max">—</span></div>
+            <div class="num-stat">Avg <span id="azure-avg">—</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Row: prices table + risk -->
+  <div class="grid-2">
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">All Spot Prices</div>
+        <div class="badge badge-live">from BigQuery</div>
+      </div>
+      <div class="panel-body" style="padding:0">
+        <table class="price-table">
+          <thead><tr>
+            <th>Cloud</th><th>Instance</th><th>GPU</th><th>Region</th><th>$/hr</th><th>Discount</th>
+          </tr></thead>
+          <tbody>
+            <tr><td colspan="6" style="text-align:center;color:var(--muted);font-family:var(--font-mono);font-size:11px;padding:20px">Loading from BigQuery...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">Preemption Risk</div>
+        <div class="badge badge-warn">Phase 2 — pending</div>
+      </div>
+      <div class="panel-body">
+        <div class="risk-item risk-low">
+          <div class="risk-header"><span class="risk-label">AWS · g4dn.xlarge · us-east-1a</span><span class="risk-score">0.12</span></div>
+          <div class="risk-bar-bg"><div class="risk-bar-fill" style="width:12%"></div></div>
+        </div>
+        <div class="risk-item risk-med">
+          <div class="risk-header"><span class="risk-label">AWS · g5.xlarge · us-east-1b</span><span class="risk-score">0.54</span></div>
+          <div class="risk-bar-bg"><div class="risk-bar-fill" style="width:54%"></div></div>
+        </div>
+        <div class="risk-item risk-high">
+          <div class="risk-header"><span class="risk-label">AWS · p3.2xlarge · us-east-1c</span><span class="risk-score">0.81</span></div>
+          <div class="risk-bar-bg"><div class="risk-bar-fill" style="width:81%"></div></div>
+        </div>
+        <div class="risk-item risk-low">
+          <div class="risk-header"><span class="risk-label">GCP · g2-standard-4 · us-central1</span><span class="risk-score">0.23</span></div>
+          <div class="risk-bar-bg"><div class="risk-bar-fill" style="width:23%"></div></div>
+        </div>
+        <div class="risk-item risk-med">
+          <div class="risk-header"><span class="risk-label">Azure · NC4as_T4_v3 · eastus</span><span class="risk-score">0.47</span></div>
+          <div class="risk-bar-bg"><div class="risk-bar-fill" style="width:47%"></div></div>
+        </div>
+        <div class="decision-box">
+          <div class="decision-action migrate">MIGRATE</div>
+          <div class="decision-reason">p3.2xlarge risk > threshold (0.70)</div>
+          <div class="decision-target">→ <span style="color:var(--gcp)">GCP g2-standard-4</span> · risk: 0.23</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Row: jobs + pareto/log -->
+  <div class="grid-3">
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">Training Jobs</div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <div class="badge badge-live" id="job-count-badge">0 active</div>
+          <button class="add-job-btn" onclick="openModal()">
+            <span class="plus">+</span> Add Job
+          </button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div id="jobs-list"></div>
+        <div class="ckpt-stats">
+          <div class="ckpt-stat"><div class="v" id="ckpt-total">—</div><div class="l">BQ rows</div></div>
+          <div class="ckpt-stat"><div class="v" style="color:var(--accent3)" id="ckpt-emergency">—</div><div class="l">preemptions</div></div>
+          <div class="ckpt-stat"><div class="v" style="color:var(--accent4)">S3 + GCS</div><div class="l">checkpoint storage</div></div>
+          <div class="ckpt-stat"><div class="v" style="color:var(--accent2)">LIVE</div><div class="l">data pipeline</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Pareto Frontier</div>
+          <div class="badge badge-warn">Phase 4 — pending</div>
+        </div>
+        <div class="panel-body" style="padding:12px">
+          <div class="pareto-wrap"><canvas id="pareto-canvas"></canvas></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Event Log</div>
+          <div class="badge badge-live">live</div>
+        </div>
+        <div class="panel-body">
+          <div class="log-feed" id="log-feed"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mock-note">
+    <span>Stat cards, price chart, price table</span> — live BigQuery ·
+    <span>Risk scores</span> — Phase 2 (XGBoost, pending) ·
+    <span>Pareto</span> — Phase 4 (pymoo, pending) ·
+    <span>Migration</span> — Phase 4 scheduler (pending)
+  </div>
+</div>
+
+<!-- Modal (unchanged structure, logic in modal.js) -->
+<div class="modal-overlay" id="modal">
+  <div class="modal" style="width:540px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
+      <div class="modal-title" style="margin-bottom:0">+ Submit Training Job</div>
+      <button onclick="closeModal()" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px;line-height:1">✕</button>
+    </div>
+    <div style="display:flex;gap:0;margin-bottom:22px;border:1px solid var(--border);border-radius:6px;overflow:hidden">
+      <div class="step-tab active" id="tab-1" onclick="goStep(1)">1 · Task</div>
+      <div class="step-tab" id="tab-2" onclick="goStep(2)">2 · Dataset</div>
+      <div class="step-tab" id="tab-3" onclick="goStep(3)">3 · Model</div>
+      <div class="step-tab" id="tab-4" onclick="goStep(4)">4 · Compute</div>
+    </div>
+    <div class="step-panel" id="step-1">
+      <div class="form-grid">
+        <div class="form-group full"><div class="form-label">Task Name</div><input class="form-input" id="f-taskname" placeholder="e.g. ResNet sweep run 1"/></div>
+        <div class="form-group full">
+          <div class="form-label">Priority</div>
+          <div style="display:flex;gap:8px;margin-top:2px">
+            <label class="priority-opt" id="pri-cheapest"><input type="radio" name="priority" value="cheapest" style="display:none"><div class="pri-box"><div class="pri-icon">$</div><div class="pri-label">Cheapest</div><div class="pri-sub">Ignore time</div></div></label>
+            <label class="priority-opt selected" id="pri-balanced"><input type="radio" name="priority" value="balanced" checked style="display:none"><div class="pri-box"><div class="pri-icon">⚖</div><div class="pri-label">Balanced</div><div class="pri-sub">Pareto optimal</div></div></label>
+            <label class="priority-opt" id="pri-fastest"><input type="radio" name="priority" value="fastest" style="display:none"><div class="pri-box"><div class="pri-icon">⚡</div><div class="pri-label">Fastest</div><div class="pri-sub">Ignore cost</div></div></label>
+          </div>
+        </div>
+        <div class="form-group"><div class="form-label">Max Budget ($)</div><input class="form-input" id="f-budget" type="number" value="2.00" min="0.10" step="0.10"/></div>
+        <div class="form-group"><div class="form-label">Max Duration (hrs)</div><input class="form-input" id="f-maxhrs" type="number" value="6" min="1"/></div>
+      </div>
+    </div>
+    <div class="step-panel" id="step-2" style="display:none">
+      <div class="form-grid">
+        <div class="form-group full"><div class="form-label">Dataset</div><select class="form-select" id="f-dataset" onchange="updateDatasetMeta()"><option value="synthetic-500k">synthetic-500k · tabular</option><option value="synthetic-100k">synthetic-100k · tabular</option><option value="custom">+ Custom S3 path</option></select></div>
+        <div class="form-group full" id="dataset-meta-wrap"><div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:12px;display:grid;grid-template-columns:repeat(4,1fr);gap:10px"><div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:3px">ROWS</div><div style="font-family:var(--font-mono);font-size:14px;font-weight:600" id="ds-rows">500,000</div></div><div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:3px">FEATURES</div><div style="font-family:var(--font-mono);font-size:14px;font-weight:600" id="ds-features">50</div></div><div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:3px">CLASSES</div><div style="font-family:var(--font-mono);font-size:14px;font-weight:600" id="ds-classes">5</div></div><div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:3px">TASK</div><div style="font-family:var(--font-mono);font-size:14px;font-weight:600" id="ds-task">classif.</div></div></div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-top:6px" id="ds-path">s3://ml-scheduler-dataset/synthetic/train/</div></div>
+        <div class="form-group full" id="custom-s3-wrap" style="display:none"><div class="form-label">S3 Path</div><input class="form-input" id="f-s3path" placeholder="s3://your-bucket/dataset/"/><div class="form-label" style="margin-top:8px">Display Name</div><input class="form-input" id="f-dsname" placeholder="my-dataset-v1"/></div>
+        <div class="form-group"><div class="form-label">Input Dim</div><input class="form-input" id="f-inputdim" type="number" value="50"/></div>
+        <div class="form-group"><div class="form-label">Num Classes</div><input class="form-input" id="f-numclasses" type="number" value="5"/></div>
+      </div>
+    </div>
+    <div class="step-panel" id="step-3" style="display:none">
+      <div class="form-grid">
+        <div class="form-group"><div class="form-label">Learning Rate</div><select class="form-select" id="f-lr"><option value="0.001">0.001 (default)</option><option value="0.0005">0.0005</option><option value="0.01">0.01</option></select></div>
+        <div class="form-group"><div class="form-label">Hidden Dim</div><select class="form-select" id="f-hidden"><option value="128">128</option><option value="256" selected>256</option><option value="512">512</option></select></div>
+        <div class="form-group"><div class="form-label">Dropout</div><select class="form-select" id="f-dropout"><option value="0.1">0.1</option><option value="0.3" selected>0.3</option><option value="0.5">0.5</option></select></div>
+        <div class="form-group"><div class="form-label">Batch Size</div><select class="form-select" id="f-batch"><option value="64" selected>64</option><option value="128">128</option><option value="256">256</option></select></div>
+        <div class="form-group"><div class="form-label">Epochs</div><input class="form-input" id="f-epochs" type="number" value="50"/></div>
+        <div class="form-group"><div class="form-label">Checkpoint every N steps</div><input class="form-input" id="f-ckpt" type="number" value="50"/></div>
+      </div>
+    </div>
+    <div class="step-panel" id="step-4" style="display:none">
+      <div class="form-grid">
+        <div class="form-group full"><div class="form-label">Target Cloud</div><select class="form-select" id="f-cloud"><option value="auto">Auto — Pareto optimizer picks</option><option value="aws">AWS only</option><option value="gcp">GCP only</option><option value="azure">Azure only</option></select></div>
+        <div class="form-group"><div class="form-label">Instance Type</div><select class="form-select" id="f-instance"><option value="g4dn.xlarge">g4dn.xlarge · T4 · $0.158/hr</option><option value="g4dn.2xlarge">g4dn.2xlarge · T4 · $0.234/hr</option><option value="g5.xlarge">g5.xlarge · A10G · $0.381/hr</option></select></div>
+        <div class="form-group"><div class="form-label">Spot Fallback</div><select class="form-select" id="f-fallback"><option value="migrate">Migrate to cheaper cloud</option><option value="pause">Pause and wait</option><option value="ondemand">Switch to on-demand</option></select></div>
+        <div class="form-group full"><div class="form-label">Notes (optional)</div><input class="form-input" id="f-notes" placeholder="e.g. sweep run 3 · higher dropout"/></div>
+      </div>
+      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:14px;margin-top:4px">
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:1px">Job Summary</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-family:var(--font-mono);font-size:11px" id="summary-content"></div>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
+      <button class="btn btn-secondary" id="btn-back" onclick="prevStep()" style="display:none">← Back</button>
+      <div style="flex:1"></div>
+      <div style="display:flex;gap:10px">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" id="btn-next" onclick="nextStep()">Next →</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Load order matters: api → chart → ui → modal → main -->
+<script src="/static/js/api.js"></script>
+<script src="/static/js/chart.js"></script>
+<script src="/static/js/ui.js"></script>
+<script src="/static/js/modal.js"></script>
+<script src="/static/js/main.js"></script>
+</body>
+</html>
