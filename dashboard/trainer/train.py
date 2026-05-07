@@ -2,28 +2,32 @@
 """
 trainer/train.py
 ─────────────────
-Generated MLP trainer with full preemption + resume support.
+MLP training script. All checkpointing delegated to CheckpointEngine.
 
 Flow:
   1. Load job_config.json from GCS
-  2. If RESUME_STEP env var set → download checkpoint_latest.pt, resume
-  3. Train, saving checkpoints to GCS every N steps
-  4. Watch for GCP preemption notice every 10 batches (~30s warning)
-  5. On preemption → emergency checkpoint → job_state status=preempted
-     → scheduler sees it → relaunches on cheapest available cloud
+  2. Build model + optimizer
+  3. engine.load() → if RESUME_STEP > 0, downloads checkpoint_latest.pt
+     from GCS (S3 fallback), restores model + optimizer weights
+  4. Train loop:
+       - every ckpt_every steps → engine.save() → GCS + S3 simultaneously
+       - every 10 batches → check GCP preemption metadata
+       - every epoch → engine.save() + write_terminal_state if needed
+  5. On preemption / budget exceeded → engine.write_terminal_state()
+     with status=preempted → server.py poller picks it up → relaunches
 
-Checkpoint layout in GCS:
-  gs://{bucket}/checkpoints/{job_id}/
-    job_config.json             ← written by launcher before VM starts
-    job_state.json              ← updated every epoch (dashboard reads)
-    checkpoint_latest.pt        ← always overwritten, used for resume
-    checkpoint_step_{N}.pt      ← milestone saves every ckpt_every steps
+Checkpoint files written to GCS + S3:
+  checkpoints/{job_id}/
+    job_config.json            ← written by launcher before VM starts
+    job_state.json             ← updated by engine after every save
+    checkpoint_latest.pt       ← always latest, used by engine.load()
+    step_{N:08d}.pt            ← milestone saves every ckpt_every steps
 """
 
-import os, sys, json, time
+import os, sys, json, time, asyncio
 from datetime import datetime, timezone
 
-# ── Dependency checks ──────────────────────────────────────────────
+# ── torch ─────────────────────────────────────────────────────────
 try:
     import torch
     import torch.nn as nn
@@ -33,94 +37,52 @@ except ImportError:
     print("[ERROR] pip install torch --index-url https://download.pytorch.org/whl/cpu")
     sys.exit(1)
 
+# ── GCS (only used to read job_config.json at startup) ────────────
 try:
     from google.cloud import storage as gcs_lib
     GCS_OK = True
 except ImportError:
     GCS_OK = False
-    print("[WARN] pip install google-cloud-storage — GCS writes disabled")
+    print("[WARN] pip install google-cloud-storage")
 
 
 # ══════════════════════════════════════════════════════════════════
-# GCS HELPERS
+# CONFIG  — read job_config.json from GCS
 # ══════════════════════════════════════════════════════════════════
 
-def gcs_read_json(bucket_name, path):
-    client = gcs_lib.Client()
-    return json.loads(client.bucket(bucket_name).blob(path).download_as_text())
+def load_config() -> dict:
+    """
+    Load job config written by launcher.launch_job() before this VM booted.
 
-def gcs_write_json(bucket_name, path, data):
-    if not GCS_OK or not bucket_name:
-        with open(os.path.basename(path), "w") as f:
-            json.dump(data, f, indent=2)
-        return
-    try:
-        gcs_lib.Client().bucket(bucket_name).blob(path).upload_from_string(
-            json.dumps(data, indent=2), content_type="application/json"
-        )
-    except Exception as e:
-        print(f"[WARN] GCS write {path}: {e}")
-
-def gcs_upload_file(bucket_name, gcs_path, local_path):
-    if not GCS_OK or not bucket_name:
-        return
-    try:
-        gcs_lib.Client().bucket(bucket_name).blob(gcs_path).upload_from_filename(local_path)
-        print(f"  [gcs] → gs://{bucket_name}/{gcs_path}")
-    except Exception as e:
-        print(f"[WARN] GCS upload {gcs_path}: {e}")
-
-def gcs_blob_exists(bucket_name, gcs_path):
-    if not GCS_OK or not bucket_name:
-        return False
-    try:
-        return gcs_lib.Client().bucket(bucket_name).blob(gcs_path).exists()
-    except Exception:
-        return False
-
-def gcs_download_file(bucket_name, gcs_path, local_path):
-    if not GCS_OK or not bucket_name:
-        return False
-    try:
-        blob = gcs_lib.Client().bucket(bucket_name).blob(gcs_path)
-        if not blob.exists():
-            return False
-        blob.download_to_filename(local_path)
-        print(f"  [gcs] downloaded gs://{bucket_name}/{gcs_path}")
-        return True
-    except Exception as e:
-        print(f"[WARN] GCS download {gcs_path}: {e}")
-        return False
-
-
-# ══════════════════════════════════════════════════════════════════
-# CONFIG LOADING
-# ══════════════════════════════════════════════════════════════════
-
-def load_config():
+    Decision: train.py reads config from GCS directly using a minimal
+    gcs_lib call here (not via CheckpointEngine) because engine needs
+    job_id to init, which comes from the config. Chicken-and-egg.
+    Fallback: local job_config.json for local testing.
+    """
     bucket = os.environ.get("GCS_BUCKET", "")
     job_id = os.environ.get("JOB_ID",     "local-test")
+
     config = None
 
-    # Try GCS first
     if bucket and GCS_OK:
         try:
-            config = gcs_read_json(bucket, f"checkpoints/{job_id}/job_config.json")
-            print(f"[OK] Config from GCS: checkpoints/{job_id}/job_config.json")
+            blob   = gcs_lib.Client().bucket(bucket).blob(
+                        f"checkpoints/{job_id}/job_config.json")
+            config = json.loads(blob.download_as_text())
+            print(f"[config] Loaded from GCS: checkpoints/{job_id}/job_config.json")
         except Exception as e:
-            print(f"[WARN] GCS config: {e}")
+            print(f"[config] GCS read failed: {e}")
 
-    # Local fallback
     if config is None and os.path.exists("job_config.json"):
         with open("job_config.json") as f:
             config = json.load(f)
-        print("[OK] Config from local job_config.json")
+        print("[config] Loaded from local job_config.json")
 
     if config is None:
-        print("[WARN] No config found — using defaults")
+        print("[config] No config found — using defaults")
         config = {}
 
-    # Defaults
+    # Defaults — all keys the training loop needs
     config.setdefault("job_id",       job_id)
     config.setdefault("task_name",    "Untitled")
     config.setdefault("lr",           0.001)
@@ -133,128 +95,25 @@ def load_config():
     config.setdefault("num_classes",  5)
     config.setdefault("max_budget",   2.0)
     config.setdefault("gcs_bucket",   bucket)
-    config.setdefault("price_usd_hr", 0.067)
+    config.setdefault("price_usd_hr", 0.067)   # e2-standard-4 spot approx
+    config.setdefault("migration_count", 0)
 
-    if os.environ.get("JOB_ID"):      config["job_id"]     = os.environ["JOB_ID"]
-    if os.environ.get("GCS_BUCKET"):  config["gcs_bucket"] = os.environ["GCS_BUCKET"]
+    # env always wins over config file
+    if os.environ.get("JOB_ID"):     config["job_id"]     = os.environ["JOB_ID"]
+    if os.environ.get("GCS_BUCKET"): config["gcs_bucket"] = os.environ["GCS_BUCKET"]
 
     return config
 
 
 # ══════════════════════════════════════════════════════════════════
-# JOB STATE  — what the dashboard reads every 60s
+# PREEMPTION + BUDGET CHECKS
 # ══════════════════════════════════════════════════════════════════
 
-def write_state(cfg, epoch, step, loss, acc, status="running", extra=None):
-    elapsed = (time.time() - cfg["_start"]) / 3600
-    state = {
-        "job_id":          cfg["job_id"],
-        "task_name":       cfg["task_name"],
-        "status":          status,
-        "epoch":           epoch,
-        "total_epochs":    cfg["epochs"],        # progress % = epoch/total_epochs
-        "step":            step,
-        "loss":            round(float(loss), 6),
-        "accuracy":        round(float(acc),  4),
-        "elapsed_hrs":     round(elapsed, 4),
-        "cost_usd":        round(elapsed * cfg["price_usd_hr"], 4),
-        "cloud":           os.environ.get("CLOUD",         "gcp"),
-        "instance":        os.environ.get("INSTANCE_TYPE", "e2-standard-4"),
-        "resumed_from":    cfg.get("_resume_step", 0),
-        "updated_at":      datetime.now(timezone.utc).isoformat(),
-    }
-    if extra:
-        state.update(extra)
-    gcs_write_json(cfg["gcs_bucket"],
-                   f"checkpoints/{cfg['job_id']}/job_state.json", state)
-    return state
-
-
-# ══════════════════════════════════════════════════════════════════
-# CHECKPOINT SAVE / LOAD
-# ══════════════════════════════════════════════════════════════════
-
-def save_checkpoint(cfg, model, optimizer, epoch, step, loss, is_emergency=False):
-    tag = "EMERGENCY" if is_emergency else f"step {step}"
-    print(f"  [ckpt] Saving {tag}...")
-
-    ckpt = {
-        "epoch":      epoch,
-        "step":       step,
-        "loss":       float(loss),
-        "model":      model.state_dict(),
-        "optimizer":  optimizer.state_dict(),
-        "config":     {k: v for k, v in cfg.items() if not k.startswith("_")},
-        "saved_at":   datetime.now(timezone.utc).isoformat(),
-        "cloud":      os.environ.get("CLOUD", "gcp"),
-        "instance":   os.environ.get("INSTANCE_TYPE", "e2-standard-4"),
-    }
-
-    local = "/tmp/checkpoint_latest.pt"
-    torch.save(ckpt, local)
-
-    bucket = cfg["gcs_bucket"]
-    job_id = cfg["job_id"]
-
-    # checkpoint_latest.pt — always overwrite, this is what resume loads
-    gcs_upload_file(bucket, f"checkpoints/{job_id}/checkpoint_latest.pt", local)
-
-    # Step-specific file for history (skip on emergency to save time)
-    if not is_emergency:
-        gcs_upload_file(bucket, f"checkpoints/{job_id}/checkpoint_step_{step}.pt", local)
-
-    print(f"  [ckpt] ✓  epoch={epoch} step={step}")
-
-
-def load_checkpoint(cfg, model, optimizer):
+def check_preemption() -> bool:
     """
-    Returns (start_epoch, start_step, last_loss).
-    Loads checkpoint_latest.pt from GCS if RESUME_STEP > 0.
-    This works regardless of which cloud we're resuming ON —
-    the checkpoint is in GCS, accessible from anywhere.
-    """
-    resume_step = int(os.environ.get("RESUME_STEP", "0"))
-    if resume_step == 0:
-        print("[train] Fresh start (RESUME_STEP=0)")
-        return 1, 0, 999.0
-
-    print(f"\n[RESUME] Resuming from step {resume_step}...")
-    prev_cloud = os.environ.get("PREV_CLOUD", "unknown")
-    curr_cloud = os.environ.get("CLOUD", "gcp")
-    if prev_cloud != curr_cloud:
-        print(f"[RESUME] Cross-cloud migration: {prev_cloud} → {curr_cloud}")
-
-    local = "/tmp/checkpoint_latest.pt"
-    ok = gcs_download_file(cfg["gcs_bucket"],
-                           f"checkpoints/{cfg['job_id']}/checkpoint_latest.pt",
-                           local)
-    if not ok:
-        print("[RESUME] No checkpoint in GCS — starting from scratch")
-        return 1, 0, 999.0
-
-    try:
-        ckpt = torch.load(local, map_location="cpu")
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        epoch = ckpt["epoch"]
-        step  = ckpt["step"]
-        loss  = ckpt.get("loss", 999.0)
-        cfg["_resume_step"] = step
-        print(f"[RESUME] ✓  epoch={epoch} step={step} loss={loss:.4f}")
-        return epoch, step, loss
-    except Exception as e:
-        print(f"[RESUME] Load failed: {e} — starting from scratch")
-        return 1, 0, 999.0
-
-
-# ══════════════════════════════════════════════════════════════════
-# PREEMPTION + BUDGET
-# ══════════════════════════════════════════════════════════════════
-
-def check_preemption():
-    """
-    Polls GCP metadata server. GCP gives ~30s notice before killing VM.
-    Returns False on non-GCP machines (safe to call anywhere).
+    Poll GCP instance metadata server for preemption notice.
+    GCP gives ~30s warning before killing a spot VM.
+    Returns False on any error (non-GCP machine, network issue).
     """
     try:
         import urllib.request
@@ -267,26 +126,53 @@ def check_preemption():
     except Exception:
         return False
 
-def check_budget(cfg):
-    elapsed = (time.time() - cfg["_start"]) / 3600
-    return (elapsed * cfg["price_usd_hr"]) >= float(cfg["max_budget"])
+
+def check_budget(cfg: dict, start_time: float) -> bool:
+    elapsed_hrs = (time.time() - start_time) / 3600
+    cost_so_far = elapsed_hrs * float(cfg["price_usd_hr"])
+    return cost_so_far >= float(cfg["max_budget"])
+
+
+def runtime_stats(cfg: dict, start_time: float) -> dict:
+    """Compute cost/time stats to pass into engine.save() extra_state."""
+    elapsed_hrs = (time.time() - start_time) / 3600
+    return {
+        "elapsed_hrs": round(elapsed_hrs, 4),
+        "cost_usd":    round(elapsed_hrs * float(cfg["price_usd_hr"]), 4),
+        "cloud":       os.environ.get("CLOUD",         "gcp"),
+        "instance":    os.environ.get("INSTANCE_TYPE", "e2-standard-4"),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
-# DATASET  — synthetic tabular (matches modal's synthetic-500k)
+# DATASET  — synthetic tabular, matches modal's synthetic-500k
 # ══════════════════════════════════════════════════════════════════
 
-def make_dataset(cfg):
-    n_tr, n_va = 10_000, 2_000
-    feat, cls  = cfg["input_dim"], cfg["num_classes"]
+def make_dataset(cfg: dict):
+    """
+    Decision: use 10k/2k synthetic rows for CPU speed.
+    The modal says synthetic-500k but training all 500k rows on
+    an e2-standard-4 CPU would take hours per epoch.
+    10k rows gives a realistic training loop that demonstrates
+    checkpointing and preemption without burning budget.
+    """
+    n_tr  = 10_000
+    n_va  =  2_000
+    feat  = int(cfg["input_dim"])
+    cls   = int(cfg["num_classes"])
+
     print(f"[data] Synthetic: {n_tr} train / {n_va} val | feat={feat} cls={cls}")
     torch.manual_seed(42)
-    return (
-        DataLoader(TensorDataset(torch.randn(n_tr, feat), torch.randint(0, cls, (n_tr,))),
-                   batch_size=cfg["batch_size"], shuffle=True),
-        DataLoader(TensorDataset(torch.randn(n_va, feat), torch.randint(0, cls, (n_va,))),
-                   batch_size=256)
+
+    tr = DataLoader(
+        TensorDataset(torch.randn(n_tr, feat), torch.randint(0, cls, (n_tr,))),
+        batch_size=int(cfg["batch_size"]), shuffle=True
     )
+    va = DataLoader(
+        TensorDataset(torch.randn(n_va, feat), torch.randint(0, cls, (n_va,))),
+        batch_size=256
+    )
+    return tr, va
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -297,108 +183,199 @@ class MLP(nn.Module):
     def __init__(self, in_dim, hidden, out_dim, dropout):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),  nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),  nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden, out_dim),
+            nn.Linear(in_dim,  hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden,  hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden,  out_dim),
         )
-    def forward(self, x): return self.net(x)
+    def forward(self, x):
+        return self.net(x)
 
 
 # ══════════════════════════════════════════════════════════════════
 # TRAINING LOOP
 # ══════════════════════════════════════════════════════════════════
 
-def train(cfg):
+def train(cfg: dict):
     print("\n" + "="*60)
-    print(f"  Job     : {cfg['job_id']}")
-    print(f"  Task    : {cfg['task_name']}")
-    print(f"  Cloud   : {os.environ.get('CLOUD','gcp')} / {os.environ.get('INSTANCE_TYPE','e2-standard-4')}")
-    print(f"  Params  : lr={cfg['lr']} hidden={cfg['hidden_dim']} dropout={cfg['dropout']}")
-    print(f"  Train   : epochs={cfg['epochs']} batch={cfg['batch_size']} ckpt_every={cfg['ckpt_every']}")
-    print(f"  Budget  : ${cfg['max_budget']} @ ${cfg['price_usd_hr']}/hr")
-    print(f"  Resume  : step {os.environ.get('RESUME_STEP','0')}")
+    print(f"  job_id   : {cfg['job_id']}")
+    print(f"  task     : {cfg['task_name']}")
+    print(f"  cloud    : {os.environ.get('CLOUD','gcp')} / "
+          f"{os.environ.get('INSTANCE_TYPE','e2-standard-4')}")
+    print(f"  lr={cfg['lr']}  hidden={cfg['hidden_dim']}  "
+          f"dropout={cfg['dropout']}  batch={cfg['batch_size']}")
+    print(f"  epochs={cfg['epochs']}  ckpt_every={cfg['ckpt_every']}")
+    print(f"  budget=${cfg['max_budget']}  "
+          f"price=${cfg['price_usd_hr']}/hr")
+    print(f"  RESUME_STEP={os.environ.get('RESUME_STEP','0')}")
     print("="*60 + "\n")
 
-    cfg["_start"]       = time.time()
-    cfg["_resume_step"] = 0
+    start_time = time.time()
 
-    model     = MLP(cfg["input_dim"], cfg["hidden_dim"], cfg["num_classes"], cfg["dropout"])
-    optimizer = optim.Adam(model.parameters(), lr=cfg["lr"])
+    # ── Model + optimizer ─────────────────────────────────────────
+    model     = MLP(int(cfg["input_dim"]), int(cfg["hidden_dim"]),
+                    int(cfg["num_classes"]), float(cfg["dropout"]))
+    optimizer = optim.Adam(model.parameters(), lr=float(cfg["lr"]))
     criterion = nn.CrossEntropyLoss()
 
-    # ── Resume ────────────────────────────────────────────────────
-    start_epoch, global_step, last_loss = load_checkpoint(cfg, model, optimizer)
-    train_loader, val_loader            = make_dataset(cfg)
+    # ── CheckpointEngine ─────────────────────────────────────────
+    # Decision: init engine AFTER model so load() can restore weights
+    from checkpoint.engine import CheckpointEngine
+    engine = CheckpointEngine(job_id=cfg["job_id"])
 
-    write_state(cfg, start_epoch, global_step, last_loss, 0.0,
-                status="running",
-                extra={"resumed_from": cfg["_resume_step"]})
-    print("[OK] Initial job_state.json written\n")
+    # ── Resume if RESUME_STEP > 0 ─────────────────────────────────
+    # engine.load() downloads checkpoint_latest.pt from GCS (S3 fallback)
+    # restores model.state_dict() + optimizer.state_dict() in-place
+    meta = engine.load(model, optimizer)
+    if meta:
+        start_epoch  = meta["epoch"]       # resume from this epoch
+        global_step  = meta["step"]        # exact step count restored
+        last_loss    = meta["loss"]
+        resumed_from = meta["step"]
+        print(f"[resume] Restored to epoch={start_epoch} step={global_step}\n")
+    else:
+        start_epoch  = 1
+        global_step  = 0
+        last_loss    = 999.0
+        resumed_from = 0
+
+    train_loader, val_loader = make_dataset(cfg)
+
+    # Write initial running state so dashboard shows job immediately
+    asyncio.run(engine.write_terminal_state(
+        epoch=start_epoch, step=global_step, loss=last_loss,
+        extra={
+            "task_name":       cfg["task_name"],
+            "status":          "running",
+            "total_epochs":    cfg["epochs"],
+            "resumed_from":    resumed_from,
+            "migration_count": cfg.get("migration_count", 0),
+            **runtime_stats(cfg, start_time),
+        }
+    ))
+    print("[state] Initial job_state.json written\n")
 
     best_val_acc = 0.0
     avg_val_loss = last_loss
     preempted    = False
 
-    for epoch in range(start_epoch, cfg["epochs"] + 1):
+    # ── Epoch loop ────────────────────────────────────────────────
+    for epoch in range(start_epoch, int(cfg["epochs"]) + 1):
 
-        # ── Pre-epoch checks ──────────────────────────────────────
+        # Pre-epoch preemption check
         if check_preemption():
-            print(f"\n[!!!] PREEMPTION at epoch={epoch} step={global_step}")
-            save_checkpoint(cfg, model, optimizer, epoch, global_step,
-                            avg_val_loss, is_emergency=True)
-            write_state(cfg, epoch, global_step, avg_val_loss, best_val_acc,
-                        status="preempted",
-                        extra={"preemption_source": "gcp_metadata",
-                               "resume_from_step":  global_step})
+            print(f"\n[!!!] PREEMPTION before epoch {epoch} step {global_step}")
+            asyncio.run(engine.save(
+                model, optimizer,
+                epoch=epoch, step=global_step, loss=avg_val_loss,
+                extra_state={
+                    "task_name":        cfg["task_name"],
+                    "status":           "preempted",
+                    "total_epochs":     cfg["epochs"],
+                    "accuracy":         best_val_acc,
+                    "best_val_acc":     best_val_acc,
+                    "resumed_from":     resumed_from,
+                    "migration_count":  cfg.get("migration_count", 0),
+                    "preemption_source": "gcp_metadata_pre_epoch",
+                    **runtime_stats(cfg, start_time),
+                }
+            ))
             preempted = True
             break
 
-        if check_budget(cfg):
-            print(f"\n[BUDGET] Limit reached at step {global_step}")
-            save_checkpoint(cfg, model, optimizer, epoch, global_step,
-                            avg_val_loss, is_emergency=True)
-            write_state(cfg, epoch, global_step, avg_val_loss, best_val_acc,
-                        status="budget_exceeded",
-                        extra={"resume_from_step": global_step})
+        # Pre-epoch budget check
+        if check_budget(cfg, start_time):
+            stats = runtime_stats(cfg, start_time)
+            print(f"\n[budget] Limit reached: ${stats['cost_usd']:.4f} "
+                  f">= ${cfg['max_budget']}")
+            asyncio.run(engine.save(
+                model, optimizer,
+                epoch=epoch, step=global_step, loss=avg_val_loss,
+                extra_state={
+                    "task_name":       cfg["task_name"],
+                    "status":          "budget_exceeded",
+                    "total_epochs":    cfg["epochs"],
+                    "accuracy":        best_val_acc,
+                    "best_val_acc":    best_val_acc,
+                    "resumed_from":    resumed_from,
+                    "migration_count": cfg.get("migration_count", 0),
+                    **stats,
+                }
+            ))
             break
 
-        # ── Train epoch ───────────────────────────────────────────
+        # ── Batch loop ────────────────────────────────────────────
         model.train()
         run_loss = 0.0
         correct  = 0
         total    = 0
 
         for i, (X, y) in enumerate(train_loader):
-            # Preemption check mid-epoch every 10 batches
+
+            # Preemption check every 10 batches
+            # Decision: every 10 batches gives ~3-5s polling frequency
+            # on a CPU VM with 10k dataset. GCP gives 30s warning
+            # so we have 6+ polls before VM dies.
             if i % 10 == 0 and check_preemption():
-                print(f"\n[!!!] PREEMPTION mid-epoch batch={i} step={global_step}")
-                save_checkpoint(cfg, model, optimizer, epoch, global_step,
-                                run_loss / max(i, 1), is_emergency=True)
-                write_state(cfg, epoch, global_step, run_loss / max(i, 1), best_val_acc,
-                            status="preempted",
-                            extra={"preemption_source": "gcp_metadata_mid_epoch",
-                                   "resume_from_step":  global_step})
+                print(f"\n[!!!] PREEMPTION mid-epoch "
+                      f"epoch={epoch} batch={i} step={global_step}")
+                avg = run_loss / max(i, 1)
+                asyncio.run(engine.save(
+                    model, optimizer,
+                    epoch=epoch, step=global_step, loss=avg,
+                    extra_state={
+                        "task_name":         cfg["task_name"],
+                        "status":            "preempted",
+                        "total_epochs":      cfg["epochs"],
+                        "accuracy":          best_val_acc,
+                        "best_val_acc":      best_val_acc,
+                        "resumed_from":      resumed_from,
+                        "migration_count":   cfg.get("migration_count", 0),
+                        "preemption_source": "gcp_metadata_mid_epoch",
+                        **runtime_stats(cfg, start_time),
+                    }
+                ))
                 preempted = True
                 break
 
+            # Forward + backward
             optimizer.zero_grad()
             out  = model(X)
             loss = criterion(out, y)
             loss.backward()
             optimizer.step()
 
-            run_loss  += loss.item()
-            correct   += (out.argmax(1) == y).sum().item()
-            total     += y.size(0)
+            run_loss    += loss.item()
+            correct     += (out.argmax(1) == y).sum().item()
+            total       += y.size(0)
             global_step += 1
 
-            # Periodic checkpoint
-            if global_step % cfg["ckpt_every"] == 0:
-                avg = run_loss / (i + 1)
-                acc = correct / total
-                print(f"  e{epoch:3d} | step {global_step:5d} | loss {avg:.4f} | acc {acc:.3f}")
-                save_checkpoint(cfg, model, optimizer, epoch, global_step, avg)
-                write_state(cfg, epoch, global_step, avg, acc)
+            # Periodic checkpoint every ckpt_every steps
+            if global_step % int(cfg["ckpt_every"]) == 0:
+                avg  = run_loss / (i + 1)
+                acc  = correct / total
+                stats = runtime_stats(cfg, start_time)
+                print(f"  e{epoch:3d} | step {global_step:5d} | "
+                      f"loss {avg:.4f} | acc {acc:.3f} | "
+                      f"${stats['cost_usd']:.4f}")
+
+                # engine.save() writes:
+                #   step_{N:08d}.pt  → GCS + S3
+                #   checkpoint_latest.pt → GCS + S3
+                #   job_state.json   → GCS only
+                asyncio.run(engine.save(
+                    model, optimizer,
+                    epoch=epoch, step=global_step, loss=avg,
+                    extra_state={
+                        "task_name":       cfg["task_name"],
+                        "status":          "running",
+                        "total_epochs":    cfg["epochs"],
+                        "accuracy":        acc,
+                        "best_val_acc":    best_val_acc,
+                        "resumed_from":    resumed_from,
+                        "migration_count": cfg.get("migration_count", 0),
+                        **stats,
+                    }
+                ))
 
         if preempted:
             break
@@ -421,28 +398,58 @@ def train(cfg):
         if val_acc > best_val_acc:
             best_val_acc = val_acc
 
-        elapsed = (time.time() - cfg["_start"]) / 3600
+        stats = runtime_stats(cfg, start_time)
         print(f"Epoch {epoch:3d}/{cfg['epochs']} | "
               f"tr={avg_tr_loss:.4f} val={avg_val_loss:.4f} "
               f"val_acc={val_acc:.3f} best={best_val_acc:.3f} "
-              f"${elapsed * cfg['price_usd_hr']:.4f}")
+              f"${stats['cost_usd']:.4f}")
 
-        write_state(cfg, epoch, global_step, avg_val_loss, val_acc,
-                    extra={"best_val_acc": round(best_val_acc, 4),
-                           "train_loss":   round(avg_tr_loss, 4)})
+        # End-of-epoch checkpoint via engine
+        asyncio.run(engine.save(
+            model, optimizer,
+            epoch=epoch, step=global_step, loss=avg_val_loss,
+            extra_state={
+                "task_name":       cfg["task_name"],
+                "status":          "running",
+                "total_epochs":    cfg["epochs"],
+                "accuracy":        val_acc,
+                "best_val_acc":    best_val_acc,
+                "train_loss":      avg_tr_loss,
+                "resumed_from":    resumed_from,
+                "migration_count": cfg.get("migration_count", 0),
+                **stats,
+            }
+        ))
 
-    # ── Completion ────────────────────────────────────────────────
+    # ── Terminal states ───────────────────────────────────────────
     if not preempted:
-        elapsed = (time.time() - cfg["_start"]) / 3600
+        stats = runtime_stats(cfg, start_time)
         print(f"\n{'='*60}")
-        print(f"  Done! best_val_acc={best_val_acc:.4f} "
-              f"time={elapsed*60:.1f}min cost=${elapsed*cfg['price_usd_hr']:.4f}")
+        print(f"  Done!  best_val_acc={best_val_acc:.4f}")
+        print(f"  Time:  {stats['elapsed_hrs']*60:.1f} min")
+        print(f"  Cost:  ${stats['cost_usd']:.4f}")
         print(f"{'='*60}\n")
-        write_state(cfg, cfg["epochs"], global_step, avg_val_loss, best_val_acc,
-                    status="done",
-                    extra={"total_cost_usd":  round(elapsed * cfg["price_usd_hr"], 4),
-                           "elapsed_minutes": round(elapsed * 60, 1),
-                           "best_val_acc":    round(best_val_acc, 4)})
+
+        # Final state — status=done
+        asyncio.run(engine.write_terminal_state(
+            epoch=int(cfg["epochs"]), step=global_step,
+            loss=avg_val_loss,
+            extra={
+                "task_name":       cfg["task_name"],
+                "status":          "done",
+                "total_epochs":    cfg["epochs"],
+                "accuracy":        best_val_acc,
+                "best_val_acc":    best_val_acc,
+                "train_loss":      avg_tr_loss,
+                "resumed_from":    resumed_from,
+                "migration_count": cfg.get("migration_count", 0),
+                **stats,
+            }
+        ))
+
+
+# ══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    train(load_config())
+    cfg = load_config()
+    train(cfg)
