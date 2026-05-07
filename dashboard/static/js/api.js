@@ -70,6 +70,7 @@ const API = (() => {
   /** 30-point price time series per cloud */
   const priceHistory   = () => _get('/api/prices/history');
 
+  
   /** min/max/avg/current per cloud over last 3 hours */
   const priceSummary   = () => _get('/api/prices/summary');
 
