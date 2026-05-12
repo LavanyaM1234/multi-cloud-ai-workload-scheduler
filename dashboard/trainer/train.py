@@ -145,33 +145,174 @@ def runtime_stats(cfg: dict, start_time: float) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
-# DATASET  — synthetic tabular, matches modal's synthetic-500k
+# DATASET
 # ══════════════════════════════════════════════════════════════════
+
+def _download_s3_dataset(s3_path: str, local_dir: str) -> list:
+    """
+    Download all CSV files from an S3 path prefix to local_dir.
+    s3_path format: s3://bucket-name/path/to/data/
+    Returns list of local file paths downloaded.
+
+    Decision: downloads ALL .csv files under the prefix.
+    For very large datasets on CPU this may be slow —
+    consider pre-splitting your dataset into shards and
+    pointing s3_path at a specific shard.
+    """
+    import boto3, re
+    from pathlib import Path
+
+    # Parse s3://bucket/prefix
+    match = re.match(r"s3://([^/]+)/?(.*)", s3_path.rstrip("/") + "/")
+    if not match:
+        raise ValueError(f"Invalid S3 path: {s3_path!r}  expected s3://bucket/prefix/")
+    bucket_name = match.group(1)
+    prefix      = match.group(2)
+
+    print(f"[data] Connecting to S3 bucket: {bucket_name}  prefix: {prefix!r}")
+
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id     = os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        region_name           = os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+    )
+
+    Path(local_dir).mkdir(parents=True, exist_ok=True)
+
+    # List all .csv objects under prefix
+    paginator = s3.get_paginator("list_objects_v2")
+    local_files = []
+    total_bytes = 0
+
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.endswith(".csv"):
+                continue
+            filename   = Path(key).name
+            local_path = os.path.join(local_dir, filename)
+            print(f"  [s3] downloading s3://{bucket_name}/{key} ({obj['Size']//1024}KB)")
+            s3.download_file(bucket_name, key, local_path)
+            local_files.append(local_path)
+            total_bytes += obj["Size"]
+
+    if not local_files:
+        raise FileNotFoundError(
+            f"No .csv files found at s3://{bucket_name}/{prefix} — "
+            f"make sure your S3 path ends with / and contains .csv files."
+        )
+
+    print(f"[data] Downloaded {len(local_files)} files "
+          f"({total_bytes // 1024}KB total) to {local_dir}")
+    return local_files
+
+
+def _load_csv_dataset(csv_files: list, cfg: dict):
+    """
+    Load CSV files into PyTorch tensors.
+
+    Decision: assumes last column is the label, all others are features.
+    This matches the synthetic dataset format and most standard
+    tabular classification datasets.
+    If your dataset has a different layout, change col_label below.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        raise RuntimeError("pip install pandas")
+
+    dfs = [pd.read_csv(f) for f in csv_files]
+    df  = pd.concat(dfs, ignore_index=True)
+
+    print(f"[data] Loaded {len(df)} rows, {len(df.columns)} columns from CSV")
+    print(f"[data] Columns: {list(df.columns)}")
+
+    # Last column = label, everything else = features
+    # Decision: drop non-numeric columns silently
+    df_numeric = df.select_dtypes(include="number")
+    if df_numeric.shape[1] < 2:
+        raise ValueError(
+            f"CSV has fewer than 2 numeric columns: {list(df.columns)} — "
+            "need at least 1 feature + 1 label column."
+        )
+
+    X = df_numeric.iloc[:, :-1].values.astype("float32")
+    y = df_numeric.iloc[:,  -1].values.astype("int64")
+
+    # Validate shapes match config
+    if X.shape[1] != int(cfg["input_dim"]):
+        print(f"[data] WARN: CSV has {X.shape[1]} features but "
+              f"input_dim={cfg['input_dim']}. Updating config.")
+        cfg["input_dim"] = X.shape[1]
+
+    n_classes = len(set(y))
+    if n_classes != int(cfg["num_classes"]):
+        print(f"[data] WARN: CSV has {n_classes} classes but "
+              f"num_classes={cfg['num_classes']}. Updating config.")
+        cfg["num_classes"] = n_classes
+
+    print(f"[data] Final: {X.shape[0]} rows, {X.shape[1]} features, "
+          f"{n_classes} classes")
+
+    X_t = torch.tensor(X)
+    y_t = torch.tensor(y)
+    return X_t, y_t
+
 
 def make_dataset(cfg: dict):
     """
-    Decision: use 10k/2k synthetic rows for CPU speed.
-    The modal says synthetic-500k but training all 500k rows on
-    an e2-standard-4 CPU would take hours per epoch.
-    10k rows gives a realistic training loop that demonstrates
-    checkpointing and preemption without burning budget.
+    Returns (train_loader, val_loader).
+
+    Routing logic:
+      dataset_type == "custom"          → download from S3, load CSV
+      dataset_type == "synthetic-*"     → generate synthetic data
+      anything else                     → generate synthetic data
+
+    Decision: 80/20 train/val split for S3 datasets.
+    Decision: synthetic uses 10k rows for CPU speed (not full 500k).
     """
-    n_tr  = 10_000
-    n_va  =  2_000
-    feat  = int(cfg["input_dim"])
-    cls   = int(cfg["num_classes"])
+    dataset_type = cfg.get("dataset_type", "synthetic-500k")
+    feat         = int(cfg["input_dim"])
+    cls          = int(cfg["num_classes"])
+    batch        = int(cfg["batch_size"])
 
-    print(f"[data] Synthetic: {n_tr} train / {n_va} val | feat={feat} cls={cls}")
-    torch.manual_seed(42)
+    if dataset_type == "custom":
+        s3_path = cfg.get("s3_dataset_path", "").strip()
+        if not s3_path:
+            raise ValueError(
+                "dataset_type=custom but s3_dataset_path is empty in job_config.json"
+            )
+        print(f"[data] Loading custom dataset from S3: {s3_path}")
 
-    tr = DataLoader(
-        TensorDataset(torch.randn(n_tr, feat), torch.randint(0, cls, (n_tr,))),
-        batch_size=int(cfg["batch_size"]), shuffle=True
-    )
-    va = DataLoader(
-        TensorDataset(torch.randn(n_va, feat), torch.randint(0, cls, (n_va,))),
-        batch_size=256
-    )
+        local_dir  = "/tmp/dataset"
+        csv_files  = _download_s3_dataset(s3_path, local_dir)
+        X_t, y_t   = _load_csv_dataset(csv_files, cfg)
+
+        # 80/20 split
+        n          = len(X_t)
+        n_train    = int(n * 0.8)
+        indices    = torch.randperm(n)
+        X_tr, y_tr = X_t[indices[:n_train]],  y_t[indices[:n_train]]
+        X_va, y_va = X_t[indices[n_train:]], y_t[indices[n_train:]]
+
+        print(f"[data] Split: {len(X_tr)} train / {len(X_va)} val")
+
+    else:
+        # Synthetic data — use 10k rows regardless of synthetic_rows config
+        # to keep CPU training time reasonable
+        n_tr = 10_000
+        n_va =  2_000
+        print(f"[data] Synthetic: {n_tr} train / {n_va} val | "
+              f"feat={feat} cls={cls}")
+        torch.manual_seed(42)
+        X_tr = torch.randn(n_tr, feat)
+        y_tr = torch.randint(0, cls, (n_tr,))
+        X_va = torch.randn(n_va, feat)
+        y_va = torch.randint(0, cls, (n_va,))
+
+    tr = DataLoader(TensorDataset(X_tr, y_tr), batch_size=batch, shuffle=True)
+    va = DataLoader(TensorDataset(X_va, y_va), batch_size=256)
     return tr, va
 
 

@@ -36,7 +36,11 @@ from pathlib import Path
 PROJECT_ID = os.getenv("GCP_PROJECT_ID",        "tensile-method-459009-k2")
 REGION     = os.getenv("GCP_REGION",            "us-central1")
 ZONE       = os.getenv("GCP_ZONE",              "us-central1-a")
-GCS_BUCKET = os.getenv("CHECKPOINT_GCS_BUCKET", "")
+GCS_BUCKET    = os.getenv("CHECKPOINT_GCS_BUCKET", "")
+S3_BUCKET     = os.getenv("CHECKPOINT_S3_BUCKET",  "")
+AWS_KEY_ID    = os.getenv("AWS_ACCESS_KEY_ID",      "")
+AWS_SECRET    = os.getenv("AWS_SECRET_ACCESS_KEY",  "")
+AWS_REGION    = os.getenv("AWS_DEFAULT_REGION",     "us-east-1")
 BASE_IMAGE = "projects/debian-cloud/global/images/family/debian-12"
 
 # Project root = one level above this file (scheduler/../)
@@ -261,11 +265,19 @@ def _create_vm(
         c if c.isalnum() or c == "-" else "-" for c in raw_name
     ).strip("-")
 
-    machine_type = f"zones/{ZONE}/machineTypes/{instance_type}"
-    startup      = _get_startup_script()
+    # ── GCP instance type mapping ──────────────────────────────────
+    # Phase 1 (GCP only): selector always returns e2-standard-4.
+    # The modal instance dropdown has AWS names (g4dn.xlarge etc) —
+    # we ignore that and always use what selector decided.
+    # TODO Phase 4 (multi-cloud): when selector can return AWS/Azure
+    # instances, launcher.py will need to route to the correct cloud's
+    # SDK here. For now we only call _create_vm for GCP.
+    gcp_instance_type = instance_type  # already e2-standard-4 from selector
+    machine_type      = f"zones/{ZONE}/machineTypes/{gcp_instance_type}"
+    startup           = _get_startup_script()
 
     print(f"[launcher] Creating VM: {instance_name}")
-    print(f"           machine: {instance_type}  zone: {ZONE}")
+    print(f"           machine: {gcp_instance_type}  zone: {ZONE}")
     print(f"           resume_step: {resume_step}  prev_cloud: {prev_cloud or 'none'}")
 
     # Boot disk — Debian 12, 20GB standard persistent
@@ -313,12 +325,19 @@ def _create_vm(
 
     # Metadata — startup script + all job env vars
     inst.metadata = compute_v1.Metadata(items=[
-        compute_v1.Items(key="startup-script",  value=startup),
-        compute_v1.Items(key="JOB_ID",          value=job_id),
-        compute_v1.Items(key="GCS_BUCKET",      value=GCS_BUCKET),
-        compute_v1.Items(key="INSTANCE_TYPE",   value=instance_type),
-        compute_v1.Items(key="RESUME_STEP",     value=str(resume_step)),
-        compute_v1.Items(key="PREV_CLOUD",      value=prev_cloud),
+        compute_v1.Items(key="startup-script",        value=startup),
+        compute_v1.Items(key="JOB_ID",                value=job_id),
+        compute_v1.Items(key="GCS_BUCKET",            value=GCS_BUCKET),
+        compute_v1.Items(key="INSTANCE_TYPE",         value=gcp_instance_type),
+        compute_v1.Items(key="RESUME_STEP",           value=str(resume_step)),
+        compute_v1.Items(key="PREV_CLOUD",            value=prev_cloud),
+        # AWS creds — needed by storage.py (checkpoint S3) and
+        # train.py (dataset download). Read from server .env.
+        compute_v1.Items(key="CHECKPOINT_GCS_BUCKET", value=GCS_BUCKET),
+        compute_v1.Items(key="CHECKPOINT_S3_BUCKET",  value=S3_BUCKET),
+        compute_v1.Items(key="AWS_ACCESS_KEY_ID",     value=AWS_KEY_ID),
+        compute_v1.Items(key="AWS_SECRET_ACCESS_KEY", value=AWS_SECRET),
+        compute_v1.Items(key="AWS_DEFAULT_REGION",    value=AWS_REGION),
     ])
 
     # Create

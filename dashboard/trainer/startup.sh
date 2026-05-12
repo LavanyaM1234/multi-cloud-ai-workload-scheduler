@@ -32,22 +32,35 @@ echo "=========================================="
 META="http://metadata.google.internal/computeMetadata/v1/instance/attributes"
 H="Metadata-Flavor: Google"
 
-JOB_ID=$(        curl -sf "${META}/JOB_ID"         -H "$H" || echo "unknown")
-GCS_BUCKET=$(    curl -sf "${META}/GCS_BUCKET"     -H "$H" || echo "")
-INSTANCE_TYPE=$( curl -sf "${META}/INSTANCE_TYPE"  -H "$H" || echo "e2-standard-4")
-RESUME_STEP=$(   curl -sf "${META}/RESUME_STEP"    -H "$H" || echo "0")
-PREV_CLOUD=$(    curl -sf "${META}/PREV_CLOUD"     -H "$H" || echo "")
+JOB_ID=$(        curl -sf "${META}/JOB_ID"                -H "$H" || echo "unknown")
+GCS_BUCKET=$(    curl -sf "${META}/GCS_BUCKET"            -H "$H" || echo "")
+INSTANCE_TYPE=$( curl -sf "${META}/INSTANCE_TYPE"         -H "$H" || echo "e2-standard-4")
+RESUME_STEP=$(   curl -sf "${META}/RESUME_STEP"           -H "$H" || echo "0")
+PREV_CLOUD=$(    curl -sf "${META}/PREV_CLOUD"            -H "$H" || echo "")
+S3_BUCKET=$(     curl -sf "${META}/CHECKPOINT_S3_BUCKET"  -H "$H" || echo "")
+AWS_KEY=$(       curl -sf "${META}/AWS_ACCESS_KEY_ID"     -H "$H" || echo "")
+AWS_SECRET=$(    curl -sf "${META}/AWS_SECRET_ACCESS_KEY" -H "$H" || echo "")
+AWS_REGION=$(    curl -sf "${META}/AWS_DEFAULT_REGION"    -H "$H" || echo "us-east-1")
 
 export JOB_ID GCS_BUCKET INSTANCE_TYPE RESUME_STEP PREV_CLOUD
 export CLOUD="gcp"
+# These match exactly what storage.py and train.py read via os.environ
+export CHECKPOINT_GCS_BUCKET="${GCS_BUCKET}"
+export CHECKPOINT_S3_BUCKET="${S3_BUCKET}"
+export AWS_ACCESS_KEY_ID="${AWS_KEY}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET}"
+export AWS_DEFAULT_REGION="${AWS_REGION}"
 
 echo ""
-echo "  JOB_ID        = ${JOB_ID}"
-echo "  GCS_BUCKET    = ${GCS_BUCKET}"
-echo "  INSTANCE_TYPE = ${INSTANCE_TYPE}"
-echo "  RESUME_STEP   = ${RESUME_STEP}"
-echo "  PREV_CLOUD    = ${PREV_CLOUD:-none (fresh start)}"
-echo "  CLOUD         = gcp"
+echo "  JOB_ID                = ${JOB_ID}"
+echo "  GCS_BUCKET            = ${GCS_BUCKET}"
+echo "  CHECKPOINT_GCS_BUCKET = ${CHECKPOINT_GCS_BUCKET}"
+echo "  CHECKPOINT_S3_BUCKET  = ${CHECKPOINT_S3_BUCKET}"
+echo "  INSTANCE_TYPE         = ${INSTANCE_TYPE}"
+echo "  RESUME_STEP           = ${RESUME_STEP}"
+echo "  PREV_CLOUD            = ${PREV_CLOUD:-none (fresh start)}"
+echo "  CLOUD                 = gcp"
+echo "  AWS_DEFAULT_REGION    = ${AWS_DEFAULT_REGION}"
 echo ""
 
 if [ "${RESUME_STEP}" != "0" ]; then
@@ -81,7 +94,8 @@ pip install --quiet \
 pip install --quiet \
     google-cloud-storage \
     boto3 \
-    numpy
+    "numpy<2" \
+    pandas
 
 echo "==> Deps installed"
 

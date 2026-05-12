@@ -1,12 +1,5 @@
 /**
- * static/js/modal.js  — updated
- * ──────────────────────────────
- * Key change: _submit() now sends ALL form fields to /api/jobs/submit
- * and handles the real response (job_id, console_url, launched: true/false).
- *
- * After a successful launch, the job appears in the jobs panel immediately
- * with status "queued" and updates to "running" once the VM boots and
- * writes its first job_state.json (~2 minutes after launch).
+ * static/js/modal.js
  */
 
 const MODAL = (() => {
@@ -16,11 +9,11 @@ const MODAL = (() => {
   const DATASETS = {
     'synthetic-500k': {
       rows: '500,000', features: '50', classes: '5', task: 'classif.',
-      path: 's3://ml-scheduler-dataset/synthetic/train/',
+      path: '',   // no S3 path — generated on VM
     },
     'synthetic-100k': {
       rows: '100,000', features: '50', classes: '5', task: 'classif.',
-      path: 's3://ml-scheduler-dataset/synthetic/train/shard_000*.csv',
+      path: '',
     },
     'custom': { rows: '—', features: '—', classes: '—', task: '—', path: '' },
   };
@@ -68,17 +61,17 @@ const MODAL = (() => {
     const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
     set('ds-rows', d.rows); set('ds-features', d.features);
     set('ds-classes', d.classes); set('ds-task', d.task);
-    const path = document.getElementById('ds-path');
-    if (path) path.textContent = d.path;
+
     const metaWrap   = document.getElementById('dataset-meta-wrap');
     const customWrap = document.getElementById('custom-s3-wrap');
-    if (metaWrap)   metaWrap.style.display   = val === 'custom' ? 'none'  : 'block';
-    if (customWrap) customWrap.style.display  = val === 'custom' ? 'block' : 'none';
+    if (metaWrap)   metaWrap.style.display  = val === 'custom' ? 'none'  : 'block';
+    if (customWrap) customWrap.style.display = val === 'custom' ? 'block' : 'none';
+
     if (val !== 'custom') {
       const inp = document.getElementById('f-inputdim');
       const cls = document.getElementById('f-numclasses');
-      if (inp) inp.value = d.features !== '—' ? d.features.replace(',','') : '50';
-      if (cls) cls.value = d.classes  !== '—' ? d.classes                  : '5';
+      if (inp) inp.value = d.features !== '—' ? d.features.replace(',', '') : '50';
+      if (cls) cls.value = d.classes  !== '—' ? d.classes                   : '5';
     }
   }
 
@@ -88,18 +81,35 @@ const MODAL = (() => {
   }
 
   function _updateSummary() {
-    const jobId = 'job-' + new Date().toISOString().slice(5,10).replace('-','') +
-                  '-' + Math.random().toString(36).slice(2,8);
+    const jobId = 'job-' + new Date().toISOString().slice(5, 10).replace('-', '') +
+                  '-' + Math.random().toString(36).slice(2, 8);
+
+    // ── Dataset display ───────────────────────────────────────────
+    const datasetType = _val('f-dataset');
+    const s3Path      = _val('f-s3path').trim();
+    const dsName      = _val('f-dsname').trim();
+
+    // What to show in summary for Dataset row
+    let datasetDisplay;
+    if (datasetType === 'custom') {
+      datasetDisplay = dsName
+        ? `${dsName} (${s3Path || 'no path set'})`
+        : (s3Path || 'custom — no path set');
+    } else {
+      datasetDisplay = datasetType;
+    }
+
     const items = [
-      ['Job ID',    jobId,                                  'color:var(--accent)'],
-      ['Task',      _val('f-taskname') || 'Untitled',       ''],
-      ['Dataset',   _val('f-dataset'),                      ''],
-      ['Priority',  document.querySelector('input[name="priority"]:checked')?.value || 'balanced', ''],
-      ['Config',    `lr=${_val('f-lr')} h=${_val('f-hidden')} e=${_val('f-epochs')}`, ''],
-      ['Compute',   `${_val('f-cloud')} · ${_val('f-instance')}`,                    ''],
-      ['Budget',    '$' + _val('f-budget'),                 'color:var(--accent2)'],
-      ['Fallback',  _val('f-fallback'),                     ''],
+      ['Job ID',   jobId,                                             'color:var(--accent)'],
+      ['Task',     _val('f-taskname') || 'Untitled',                  ''],
+      ['Dataset',  datasetDisplay,                                     ''],
+      ['Priority', document.querySelector('input[name="priority"]:checked')?.value || 'balanced', ''],
+      ['Config',   `lr=${_val('f-lr')} h=${_val('f-hidden')} e=${_val('f-epochs')}`, ''],
+      ['Compute',  `${_val('f-cloud')} · ${_val('f-instance')}`,      ''],
+      ['Budget',   '$' + _val('f-budget'),                            'color:var(--accent2)'],
+      ['Fallback', _val('f-fallback'),                                 ''],
     ];
+
     const box = document.getElementById('summary-content');
     if (!box) return;
     box.innerHTML = items.map(([label, val, style]) =>
@@ -112,86 +122,119 @@ const MODAL = (() => {
   }
 
   async function _submit() {
-    const btnNext = document.getElementById('btn-next');
-    if (btnNext) {
-      btnNext.textContent = 'Launching...';
-      btnNext.disabled    = true;
+    const summary = document.getElementById('summary-content');
+    const jobId   = summary?.dataset.jobId || ('job-' + Date.now());
+
+    // ── Dataset fields ────────────────────────────────────────────
+    // dataset_type: "synthetic-500k" | "synthetic-100k" | "custom"
+    // s3_dataset_path: full S3 path, only used when dataset_type=custom
+    //   e.g. s3://my-dataset-bucket/train/
+    // dataset_name: human-readable label for the dataset
+    //
+    // These map to job_config.json fields that train.py reads:
+    //   cfg["dataset_type"]    → routes to synthetic or S3 loader
+    //   cfg["s3_dataset_path"] → parsed for bucket + prefix by _download_s3_dataset()
+    //   cfg["dataset_name"]    → display only, shown in dashboard
+    const datasetType    = _val('f-dataset') || 'synthetic-500k';
+    const s3DatasetPath  = _val('f-s3path').trim();
+    const datasetName    = _val('f-dsname').trim() || datasetType;
+
+    // Validate custom dataset before submitting
+    if (datasetType === 'custom' && !s3DatasetPath) {
+      UI.addLog('log-err', 'Custom dataset selected but no S3 path entered (Step 2)');
+      const btn = document.getElementById('btn-next');
+      if (btn) { btn.textContent = 'Launch Job'; btn.disabled = false; }
+      // Go back to dataset step so user can fill it in
+      _goStep(2);
+      return;
     }
 
-    // ── Collect ALL form fields ──────────────────────────────────
+    if (datasetType === 'custom' && !s3DatasetPath.startsWith('s3://')) {
+      UI.addLog('log-err', 'S3 path must start with s3://  e.g. s3://my-bucket/data/');
+      _goStep(2);
+      return;
+    }
+
+    // ── Build request body ────────────────────────────────────────
     const body = {
-      // Step 1 — Task
-      task_name:    _val('f-taskname') || 'Untitled',
-      priority:     document.querySelector('input[name="priority"]:checked')?.value || 'balanced',
-      max_budget:   parseFloat(_val('f-budget'))   || 2.0,
-      deadline_hrs: parseFloat(_val('f-maxhrs'))   || 8.0,
+      // Identity
+      job_id:           jobId,
+      task_name:        _val('f-taskname') || 'Untitled',
 
-      // Step 2 — Dataset
-      dataset:      _val('f-dataset'),
-      s3_path:      _val('f-s3path'),      // only used if dataset = 'custom'
-      input_dim:    parseInt(_val('f-inputdim'))    || 50,
-      num_classes:  parseInt(_val('f-numclasses'))  || 5,
+      // Budget / deadline (Step 1)
+      max_budget:       parseFloat(_val('f-budget'))  || 2.0,
+      deadline_hrs:     parseFloat(_val('f-maxhrs'))  || 8.0,
+      priority:         document.querySelector('input[name="priority"]:checked')?.value || 'balanced',
 
-      // Step 3 — Model
-      lr:           parseFloat(_val('f-lr'))        || 0.001,
-      hidden_dim:   parseInt(_val('f-hidden'))       || 256,
-      dropout:      parseFloat(_val('f-dropout'))   || 0.3,
-      batch_size:   parseInt(_val('f-batch'))        || 64,
-      epochs:       parseInt(_val('f-epochs'))       || 50,
-      ckpt_every:   parseInt(_val('f-ckpt'))         || 50,
+      // Dataset (Step 2)
+      // NOTE: "dataset" key kept for backwards compat with old server versions
+      dataset:          datasetType,
+      dataset_type:     datasetType,        // ← routes synthetic vs S3 in train.py
+      s3_dataset_path:  s3DatasetPath,      // ← s3://bucket/prefix/, empty for synthetic
+      dataset_name:     datasetName,        // ← display name
 
-      // Step 4 — Compute
-      cloud:        _val('f-cloud'),        // 'auto' | 'aws' | 'gcp' | 'azure'
-      instance:     _val('f-instance'),
-      fallback:     _val('f-fallback'),
+      input_dim:        parseInt(_val('f-inputdim'))   || 50,
+      num_classes:      parseInt(_val('f-numclasses'))  || 5,
+
+      // Model (Step 3)
+      lr:               parseFloat(_val('f-lr'))      || 0.001,
+      hidden_dim:       parseInt(_val('f-hidden'))     || 256,
+      dropout:          parseFloat(_val('f-dropout'))  || 0.3,
+      batch_size:       parseInt(_val('f-batch'))      || 64,
+      epochs:           parseInt(_val('f-epochs'))     || 50,
+      ckpt_every:       parseInt(_val('f-ckpt'))       || 50,
+
+      // Compute (Step 4)
+      cloud:            _val('f-cloud')    || 'gcp',
+      instance:         _val('f-instance') || 'e2-standard-4',
+      fallback:         _val('f-fallback') || 'migrate',
+
+      // Legacy fields
+      model_arch:       'mlp',
+      dataset_size:     parseInt(_val('f-inputdim')) || 50,
+      min_gpu_mem:      0,
     };
+
+    // ── Show submitting state ─────────────────────────────────────
+    const btn = document.getElementById('btn-next');
+    if (btn) { btn.textContent = 'Submitting...'; btn.disabled = true; }
 
     try {
       const resp = await API.submitJob(body);
 
-      if (resp.error) {
-        UI.addLog('log-err', `Launch failed: ${resp.error}`);
-        alert(`Launch failed: ${resp.error}`);
+      if (!resp || resp.error) {
+        UI.addLog('log-err', `Launch failed: ${resp?.error || 'no response'}`);
         return;
       }
 
-      // ── Job launched — add to dashboard immediately ───────────
+      // ── Build job card meta ───────────────────────────────────
+      const dsLabel = datasetType === 'custom'
+        ? `dataset: ${datasetName}`
+        : `dataset: ${datasetType}`;
+
       UI.addJob({
-        id:     resp.job_id,
+        id:     jobId,
         name:   `${body.task_name} · lr=${body.lr} · h=${body.hidden_dim}`,
-        meta:   `${resp.cloud?.toUpperCase()} ${resp.instance_type} · ` +
-                `$${resp.price_usd_hr?.toFixed(3)}/hr · queued (VM booting ~2min)`,
+        meta:   `GCP ${resp.instance_type || 'e2-standard-4'} · `
+              + `$${resp.price_usd_hr?.toFixed(3)}/hr · `
+              + `${dsLabel} · ⏳ VM creating (~90s)...`,
         pct:    0,
         status: 'running',
         cloud:  resp.cloud || 'gcp',
-        console_url: resp.console_url || '',
       });
 
       UI.addLog('log-ok',
-        `Job ${resp.job_id} launched → ${resp.cloud} ${resp.instance_type} ` +
-        `· est $${resp.est_cost?.toFixed(2)}`
+        `Job ${jobId} queued → GCP ${resp.instance_type} · ${dsLabel}`
       );
-
-      if (resp.console_url) {
-        UI.addLog('log-info',
-          `VM console: <a href="${resp.console_url}" target="_blank" ` +
-          `style="color:var(--accent)">open</a>`
-        );
-      }
 
       close();
 
     } catch (e) {
       UI.addLog('log-err', `Submit error: ${e.message}`);
-      alert(`Error: ${e.message}`);
     } finally {
-      if (btnNext) {
-        btnNext.textContent = 'Launch Job';
-        btnNext.disabled    = false;
-      }
+      if (btn) { btn.textContent = 'Launch Job'; btn.disabled = false; }
     }
   }
 
-  // expose _goStep for tab onclick handlers in HTML
   return { open, close, next, prev, updateDatasetMeta, _goStep };
 })();

@@ -210,27 +210,37 @@ const UI = (() => {
     renderJobs();
   }
 
-  function mergeRealJobs(realJobs) {
+ function mergeRealJobs(realJobs) {
     if (!realJobs || realJobs.length === 0) return;
-    realJobs.forEach(state => {
-      const existing = _jobs.findIndex(j => j.id === state.job_id);
-      const pct = state.total_epochs
-        ? Math.round((state.epoch / state.total_epochs) * 100)
-        : 0;
-      const job = {
-        id:          state.job_id,
-        name:        state.task_name || state.job_id,
-        meta:        `epoch ${state.epoch}/${state.total_epochs} · loss ${state.loss?.toFixed(4) || '?'}`,
-        pct:         Math.min(pct, 99),
-        status:      state.status || 'running',
-        cloud:       state.cloud  || 'gcp',
-        console_url: '',
-      };
-      if (existing >= 0) { _jobs[existing] = { ..._jobs[existing], ...job }; }
-      else               { _jobs.push(job); }
-    });
+ 
+    // Keep any locally-submitted jobs that aren't in GCS yet
+    const gcsIds = new Set(realJobs.map(j => j.job_id));
+    const localOnly = _jobs.filter(j => !gcsIds.has(j.id));
+ 
+    const statusMap = {
+      running:        'running',
+      queued:         'running',    // show as running while VM boots
+      migrating:      'migrating',
+      paused:         'paused',
+      done:           'done',
+      preempted:      'paused',
+      budget_exceeded:'done',
+      launch_failed:  'paused',
+    };
+ 
+    const fromGcs = realJobs.map(j => ({
+      id:     j.job_id,
+      name:   j.task_name || j.job_id,
+      meta:   _buildMeta(j),
+      pct:    j.progress_pct ?? Math.min(99, Math.round(((j.epoch || 0) / 50) * 100)),
+      status: statusMap[j.status] || 'running',
+      cloud:  j.cloud || 'gcp',
+    }));
+ 
+    _jobs = [...fromGcs, ...localOnly];
     renderJobs();
   }
+ 
 
   /**
    * Poll active jobs every 10s to get live progress.
@@ -250,6 +260,21 @@ const UI = (() => {
       }
     });
   }
+
+   function _buildMeta(state) {
+    const parts = [];
+    if (state.instance)  parts.push(`GCP ${state.instance}`);
+    if (state.epoch)     parts.push(`epoch ${state.epoch}`);
+    if (state.step)      parts.push(`step ${state.step}`);
+    if (state.loss != null) parts.push(`loss ${parseFloat(state.loss).toFixed(4)}`);
+    if (state.accuracy != null) parts.push(`acc ${parseFloat(state.accuracy).toFixed(3)}`);
+    if (state.cost_usd != null) parts.push(`$${parseFloat(state.cost_usd).toFixed(3)}`);
+    if (state.status === 'done') parts.push('✓ complete');
+    if (state.status === 'preempted') parts.push('⚡ preempted');
+    if (state.status === 'queued') parts.push('⏳ VM booting...');
+    return parts.join(' · ') || state.status;
+  }
+ 
 
   return {
     startClock,

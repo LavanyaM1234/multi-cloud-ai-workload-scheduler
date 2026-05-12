@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Multi-Cloud Scheduler Dashboard</title>
-<link rel="stylesheet" href="static/css/style.css"> 
+<link rel="stylesheet" href="static/css/style.css">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 </head>
@@ -26,6 +26,12 @@
     <span style="color:var(--border2)">|</span>
     <span class="clock" id="clock">--:--:-- UTC</span>
   </div>
+  <!-- ── Theme toggle ── -->
+  <button class="theme-toggle" onclick="toggleTheme()" title="Switch theme">
+    <span class="theme-icon">☀</span>
+    <span class="theme-label-dark">Light</span>
+    <span class="theme-label-light">Dark</span>
+  </button>
 </div>
 
 <div class="main">
@@ -33,7 +39,7 @@
   <!-- Stat cards -->
   <div class="stats-row">
     <div class="stat-card aws">
-      <div class="stat-label">AWS sspot / hr</div>
+      <div class="stat-label">AWS spot / hr</div>
       <div class="stat-value" id="aws-price">$—</div>
       <div class="stat-sub">g4dn.xlarge · us-east-1a</div>
       <div class="stat-delta" id="aws-delta">loading...</div>
@@ -71,7 +77,7 @@
         <div class="badge badge-mock" id="api-status-badge" title="Checking API...">MOCK DATA</div>
       </div>
     </div>
-    <div class="panel-body">
+    <div class="panel-body chart-body">
       <div class="chart-wrap"><canvas id="price-chart"></canvas></div>
       <div class="chart-numerics">
         <div class="num-card aws">
@@ -213,7 +219,7 @@
   </div>
 </div>
 
-<!-- Modal (unchanged structure, logic in modal.js) -->
+<!-- Modal -->
 <div class="modal-overlay" id="modal">
   <div class="modal" style="width:540px">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
@@ -263,7 +269,13 @@
     <div class="step-panel" id="step-4" style="display:none">
       <div class="form-grid">
         <div class="form-group full"><div class="form-label">Target Cloud</div><select class="form-select" id="f-cloud"><option value="auto">Auto — Pareto optimizer picks</option><option value="aws">AWS only</option><option value="gcp">GCP only</option><option value="azure">Azure only</option></select></div>
-        <div class="form-group"><div class="form-label">Instance Type</div><select class="form-select" id="f-instance"><option value="g4dn.xlarge">g4dn.xlarge · T4 · $0.158/hr</option><option value="g4dn.2xlarge">g4dn.2xlarge · T4 · $0.234/hr</option><option value="g5.xlarge">g5.xlarge · A10G · $0.381/hr</option></select></div>
+        <div class="form-group"><div class="form-label">Instance Type</div>
+          <select class="form-select" id="f-instance">
+            <option value="e2-standard-4">e2-standard-4 · CPU · $0.067/hr (GCP)</option>
+            <option value="e2-standard-8">e2-standard-8 · CPU · $0.134/hr (GCP)</option>
+            <option value="n1-standard-4">n1-standard-4 · CPU · $0.095/hr (GCP)</option>
+          </select>
+        </div>
         <div class="form-group"><div class="form-label">Spot Fallback</div><select class="form-select" id="f-fallback"><option value="migrate">Migrate to cheaper cloud</option><option value="pause">Pause and wait</option><option value="ondemand">Switch to on-demand</option></select></div>
         <div class="form-group full"><div class="form-label">Notes (optional)</div><input class="form-input" id="f-notes" placeholder="e.g. sweep run 3 · higher dropout"/></div>
       </div>
@@ -289,5 +301,26 @@
 <script src="/static/js/ui.js"></script>
 <script src="/static/js/modal.js"></script>
 <script src="/static/js/main.js"></script>
+
+<!-- ── Theme toggle ── -->
+<script>
+  // Apply saved theme before first paint to avoid flash
+  (function () {
+    if (localStorage.getItem('theme') === 'light') {
+      document.documentElement.classList.add('light');
+    }
+  })();
+
+  function toggleTheme() {
+    const isLight = document.documentElement.classList.toggle('light');
+    localStorage.setItem('theme', isLight ? 'light' : 'dark');
+    // Redraw canvas charts — colours change with theme
+    if (typeof CHART !== 'undefined') {
+      CHART.drawPriceChart();
+      CHART.drawPareto();
+    }
+  }
+</script>
+
 </body>
 </html>

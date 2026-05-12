@@ -2,13 +2,38 @@
 
 *{box-sizing:border-box;margin:0;padding:0}
 
-:root{
+/* ══════════════════════════════════════════════════════════════
+   DARK THEME (default)
+   ══════════════════════════════════════════════════════════════ */
+:root {
   --bg:#0a0e17;--bg2:#111827;--bg3:#1a2332;--bg4:#0f1923;
   --border:rgba(99,179,237,0.12);--border2:rgba(99,179,237,0.25);
   --accent:#63b3ed;--accent2:#68d391;--accent3:#fc8181;--accent4:#f6ad55;
   --text:#e2e8f0;--muted:#718096;--muted2:#4a5568;
   --aws:#f6ad55;--gcp:#68d391;--azure:#63b3ed;
   --font-mono:'IBM Plex Mono',monospace;--font-sans:'IBM Plex Sans',sans-serif;
+  --shadow:0 2px 8px rgba(0,0,0,0.4);
+  --theme-icon:'☀';
+}
+
+/* ══════════════════════════════════════════════════════════════
+   LIGHT THEME — applied when <html> has class="light"
+   ══════════════════════════════════════════════════════════════ */
+html.light {
+  --bg:#f0f4f8;--bg2:#ffffff;--bg3:#e8eef5;--bg4:#f7fafc;
+  --border:rgba(49,130,206,0.15);--border2:rgba(49,130,206,0.30);
+  --accent:#2b6cb0;--accent2:#276749;--accent3:#c53030;--accent4:#c05621;
+  --text:#1a202c;--muted:#4a5568;--muted2:#718096;
+  --aws:#c05621;--gcp:#276749;--azure:#2b6cb0;
+  --shadow:0 2px 8px rgba(0,0,0,0.10);
+  --theme-icon:'🌙';
+}
+
+/* Smooth transition when switching themes */
+body, .header, .panel, .stat-card, .modal, .num-card,
+.form-input, .form-select, .btn-sm, .log-feed {
+  transition: background-color 0.2s ease, color 0.2s ease,
+              border-color 0.2s ease;
 }
 
 body{background:var(--bg);color:var(--text);font-family:var(--font-sans);font-size:13px;min-height:100vh}
@@ -22,12 +47,46 @@ body{background:var(--bg);color:var(--text);font-family:var(--font-sans);font-si
 .hdr-meta{font-family:var(--font-mono);font-size:11px;color:var(--muted);display:flex;gap:16px;align-items:center}
 .hdr-meta .clock{color:var(--text)}
 
+/* ── Theme toggle button ── */
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border2);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.theme-toggle:hover {
+  background: rgba(99,179,237,0.08);
+  color: var(--text);
+  border-color: var(--accent);
+}
+html.light .theme-toggle:hover {
+  background: rgba(43,108,176,0.08);
+}
+.theme-toggle .theme-icon {
+  font-size: 13px;
+  line-height: 1;
+}
+/* Label text changes per theme */
+.theme-toggle .theme-label-dark  { display: inline; }
+.theme-toggle .theme-label-light { display: none;   }
+html.light .theme-toggle .theme-label-dark  { display: none;   }
+html.light .theme-toggle .theme-label-light { display: inline; }
+
 /* ── Layout ── */
 .main{padding:18px 24px;display:flex;flex-direction:column;gap:14px}
 
 /* ── Stat cards ── */
 .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-.stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:16px;position:relative;overflow:hidden}
+.stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:16px;position:relative;overflow:hidden;box-shadow:var(--shadow)}
 .stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
 .stat-card.aws::before{background:var(--aws)}
 .stat-card.gcp::before{background:var(--gcp)}
@@ -45,7 +104,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--font-sans);font-si
 .delta-down{color:var(--accent2)}
 
 /* ── Panel ── */
-.panel{background:var(--bg2);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.panel{background:var(--bg2);border:1px solid var(--border);border-radius:8px;overflow:hidden;box-shadow:var(--shadow)}
 .panel-header{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;border-bottom:1px solid var(--border)}
 .panel-title{font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);text-transform:uppercase;letter-spacing:1px}
 .badge{font-family:var(--font-mono);font-size:10px;padding:2px 8px;border-radius:3px}
@@ -54,6 +113,13 @@ body{background:var(--bg);color:var(--text);font-family:var(--font-sans);font-si
 .badge-info{background:rgba(99,179,237,.1);color:var(--accent);border:1px solid rgba(99,179,237,.2)}
 .badge-warn{background:rgba(252,129,129,.1);color:var(--accent3);border:1px solid rgba(252,129,129,.2)}
 .panel-body{padding:16px}
+.panel-body.chart-body{padding:16px;display:flex;flex-direction:column;gap:0}
+
+/* Light theme badge adjustments — keep readable on white bg */
+html.light .badge-live{background:rgba(39,103,73,.1);border-color:rgba(39,103,73,.25)}
+html.light .badge-mock{background:rgba(192,86,33,.1);border-color:rgba(192,86,33,.25)}
+html.light .badge-warn{background:rgba(197,48,48,.1);border-color:rgba(197,48,48,.25)}
+html.light .badge-info{background:rgba(43,108,176,.1);border-color:rgba(43,108,176,.25)}
 
 /* ── Grid layouts ── */
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
@@ -61,12 +127,15 @@ body{background:var(--bg);color:var(--text);font-family:var(--font-sans);font-si
 .grid-sidebar{display:grid;grid-template-columns:2fr 1fr;gap:14px}
 
 /* ── Price chart ── */
-.chart-wrap{position:relative;width:100%;height:220px}
+.chart-wrap{position:relative;width:100%;height:380px}
+/* When inside chart-body flex container, grow to fill available space */
+.chart-body .chart-wrap{flex:1;min-height:320px;height:auto}
+.chart-body canvas{position:absolute;top:0;left:0;width:100%;height:100%}
 canvas{display:block}
 .chart-legend{display:flex;gap:16px;margin-bottom:10px}
 .legend-item{display:flex;align-items:center;gap:6px;font-family:var(--font-mono);font-size:11px}
 .legend-dot{width:10px;height:3px;border-radius:2px}
-.chart-numerics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}
+.chart-numerics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px}
 .num-card{background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px 12px}
 .num-cloud{font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px}
 .num-current{font-family:var(--font-mono);font-size:18px;font-weight:600}
@@ -83,10 +152,14 @@ canvas{display:block}
 .price-table td{font-family:var(--font-mono);font-size:11px;padding:8px 8px;border-bottom:1px solid rgba(99,179,237,.04)}
 .price-table tr:last-child td{border-bottom:none}
 .price-table tr:hover td{background:rgba(99,179,237,.03)}
+html.light .price-table tr:hover td{background:rgba(43,108,176,.04)}
 .cloud-tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:500}
 .cloud-tag.aws{background:rgba(246,173,85,.15);color:var(--aws)}
 .cloud-tag.gcp{background:rgba(104,211,145,.15);color:var(--gcp)}
 .cloud-tag.azure{background:rgba(99,179,237,.15);color:var(--azure)}
+html.light .cloud-tag.aws{background:rgba(192,86,33,.12)}
+html.light .cloud-tag.gcp{background:rgba(39,103,73,.12)}
+html.light .cloud-tag.azure{background:rgba(43,108,176,.12)}
 .price-val.low{color:var(--accent2)}
 .price-val.mid{color:var(--accent4)}
 .price-val.high{color:var(--accent3)}
@@ -116,6 +189,7 @@ canvas{display:block}
 /* ── Jobs ── */
 .job-row{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(99,179,237,.05)}
 .job-row:last-child{border-bottom:none}
+html.light .job-row{border-bottom-color:rgba(43,108,176,.08)}
 .job-id{font-family:var(--font-mono);font-size:11px;color:var(--accent);width:100px;flex-shrink:0}
 .job-info{flex:1;min-width:0}
 .job-name{font-size:12px;color:var(--text);margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -136,8 +210,9 @@ canvas{display:block}
 
 /* ── Modal ── */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;display:none;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+html.light .modal-overlay{background:rgba(0,0,0,.4)}
 .modal-overlay.open{display:flex}
-.modal{background:var(--bg2);border:1px solid var(--border2);border-radius:10px;padding:24px;width:460px;max-width:90vw}
+.modal{background:var(--bg2);border:1px solid var(--border2);border-radius:10px;padding:24px;width:460px;max-width:90vw;box-shadow:var(--shadow)}
 .modal-title{font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--accent);margin-bottom:20px;text-transform:uppercase;letter-spacing:1px}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
 .form-group{display:flex;flex-direction:column;gap:5px}
@@ -148,8 +223,9 @@ canvas{display:block}
 .form-select option{background:var(--bg2)}
 .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}
 .btn{font-family:var(--font-mono);font-size:11px;padding:8px 16px;border-radius:5px;border:none;cursor:pointer;transition:all .15s}
-.btn-primary{background:var(--accent);color:#0a0e17;font-weight:600}
-.btn-primary:hover{background:#90cdf4}
+.btn-primary{background:var(--accent);color:#fff;font-weight:600}
+html.light .btn-primary{color:#fff}
+.btn-primary:hover{opacity:0.88}
 .btn-secondary{background:transparent;border:1px solid var(--border);color:var(--muted)}
 .btn-secondary:hover{border-color:var(--border2);color:var(--text)}
 
@@ -176,6 +252,7 @@ canvas{display:block}
 /* ── Add job button ── */
 .add-job-btn{display:flex;align-items:center;gap:6px;font-family:var(--font-mono);font-size:11px;padding:5px 12px;border-radius:4px;border:1px solid var(--border2);background:transparent;color:var(--accent);cursor:pointer;transition:all .15s}
 .add-job-btn:hover{background:rgba(99,179,237,.1)}
+html.light .add-job-btn:hover{background:rgba(43,108,176,.08)}
 .add-job-btn .plus{font-size:16px;line-height:1}
 
 /* ── Footer note ── */
@@ -187,12 +264,14 @@ canvas{display:block}
 .step-tab:last-child{border-right:none}
 .step-tab:hover{color:var(--text);background:rgba(99,179,237,.05)}
 .step-tab.active{color:var(--accent);background:rgba(99,179,237,.08);font-weight:600}
+html.light .step-tab.active{background:rgba(43,108,176,.08)}
 
 /* ── Priority selector ── */
 .priority-opt{flex:1;cursor:pointer}
 .pri-box{background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px 8px;text-align:center;transition:all .15s}
 .pri-box:hover{border-color:var(--border2)}
 .priority-opt.selected .pri-box{border-color:var(--accent);background:rgba(99,179,237,.08)}
+html.light .priority-opt.selected .pri-box{background:rgba(43,108,176,.08)}
 .pri-icon{font-size:18px;margin-bottom:4px}
 .pri-label{font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--text)}
 .pri-sub{font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-top:2px}
