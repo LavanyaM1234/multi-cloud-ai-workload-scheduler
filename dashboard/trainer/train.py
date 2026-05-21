@@ -10,16 +10,23 @@ Flow:
   3. engine.load() → if RESUME_STEP > 0, downloads checkpoint_latest.pt
      from GCS (S3 fallback), restores model + optimizer weights
   4. Train loop:
-       - every ckpt_every steps → engine.save() → GCS + S3 simultaneously
+       - top of every epoch → check_command() for server-side commands
        - every 10 batches → check GCP preemption metadata
+       - every ckpt_every steps → engine.save() → GCS + S3 simultaneously
        - every epoch → engine.save() + write_terminal_state if needed
   5. On preemption / budget exceeded → engine.write_terminal_state()
      with status=preempted → server.py poller picks it up → relaunches
+
+Commands (written by server.py to GCS, consumed once):
+    migrate    → save checkpoint, exit with status=preempted
+    stop       → save final checkpoint, exit cleanly
+    reduce_lr  → multiply all param group LRs by 0.1, continue training
 
 Checkpoint files written to GCS + S3:
   checkpoints/{job_id}/
     job_config.json            ← written by launcher before VM starts
     job_state.json             ← updated by engine after every save
+    job_command.json           ← written by server.py, consumed here
     checkpoint_latest.pt       ← always latest, used by engine.load()
     step_{N:08d}.pt            ← milestone saves every ckpt_every steps
 """
@@ -106,6 +113,36 @@ def load_config() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
+# COMMAND POLLING  — server.py writes these, train.py consumes once
+# ══════════════════════════════════════════════════════════════════
+
+def check_command(cfg: dict) -> str | None:
+    """
+    Check GCS for a command written by server.py poller.
+    Returns command string or None.
+    Deletes the command file after reading (so it fires only once).
+
+    Supported commands:
+        migrate    → save checkpoint, exit with status=preempted
+        stop       → save final checkpoint, exit cleanly
+        reduce_lr  → multiply all LRs by 0.1, continue training
+    """
+    if not GCS_OK or not cfg.get("gcs_bucket"):
+        return None
+    try:
+        bucket = gcs_lib.Client().bucket(cfg["gcs_bucket"])
+        blob   = bucket.blob(f"checkpoints/{cfg['job_id']}/job_command.json")
+        if not blob.exists():
+            return None
+        cmd = json.loads(blob.download_as_text()).get("command")
+        blob.delete()   # consume command — won't fire again
+        print(f"[command] Received: {cmd}")
+        return cmd
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════
 # PREEMPTION + BUDGET CHECKS
 # ══════════════════════════════════════════════════════════════════
 
@@ -153,16 +190,10 @@ def _download_s3_dataset(s3_path: str, local_dir: str) -> list:
     Download all CSV files from an S3 path prefix to local_dir.
     s3_path format: s3://bucket-name/path/to/data/
     Returns list of local file paths downloaded.
-
-    Decision: downloads ALL .csv files under the prefix.
-    For very large datasets on CPU this may be slow —
-    consider pre-splitting your dataset into shards and
-    pointing s3_path at a specific shard.
     """
     import boto3, re
     from pathlib import Path
 
-    # Parse s3://bucket/prefix
     match = re.match(r"s3://([^/]+)/?(.*)", s3_path.rstrip("/") + "/")
     if not match:
         raise ValueError(f"Invalid S3 path: {s3_path!r}  expected s3://bucket/prefix/")
@@ -180,8 +211,7 @@ def _download_s3_dataset(s3_path: str, local_dir: str) -> list:
 
     Path(local_dir).mkdir(parents=True, exist_ok=True)
 
-    # List all .csv objects under prefix
-    paginator = s3.get_paginator("list_objects_v2")
+    paginator   = s3.get_paginator("list_objects_v2")
     local_files = []
     total_bytes = 0
 
@@ -211,11 +241,7 @@ def _download_s3_dataset(s3_path: str, local_dir: str) -> list:
 def _load_csv_dataset(csv_files: list, cfg: dict):
     """
     Load CSV files into PyTorch tensors.
-
-    Decision: assumes last column is the label, all others are features.
-    This matches the synthetic dataset format and most standard
-    tabular classification datasets.
-    If your dataset has a different layout, change col_label below.
+    Assumes last column is the label, all others are features.
     """
     try:
         import pandas as pd
@@ -226,10 +252,7 @@ def _load_csv_dataset(csv_files: list, cfg: dict):
     df  = pd.concat(dfs, ignore_index=True)
 
     print(f"[data] Loaded {len(df)} rows, {len(df.columns)} columns from CSV")
-    print(f"[data] Columns: {list(df.columns)}")
 
-    # Last column = label, everything else = features
-    # Decision: drop non-numeric columns silently
     df_numeric = df.select_dtypes(include="number")
     if df_numeric.shape[1] < 2:
         raise ValueError(
@@ -240,7 +263,6 @@ def _load_csv_dataset(csv_files: list, cfg: dict):
     X = df_numeric.iloc[:, :-1].values.astype("float32")
     y = df_numeric.iloc[:,  -1].values.astype("int64")
 
-    # Validate shapes match config
     if X.shape[1] != int(cfg["input_dim"]):
         print(f"[data] WARN: CSV has {X.shape[1]} features but "
               f"input_dim={cfg['input_dim']}. Updating config.")
@@ -254,23 +276,16 @@ def _load_csv_dataset(csv_files: list, cfg: dict):
 
     print(f"[data] Final: {X.shape[0]} rows, {X.shape[1]} features, "
           f"{n_classes} classes")
-
-    X_t = torch.tensor(X)
-    y_t = torch.tensor(y)
-    return X_t, y_t
+    return torch.tensor(X), torch.tensor(y)
 
 
 def make_dataset(cfg: dict):
     """
     Returns (train_loader, val_loader).
 
-    Routing logic:
-      dataset_type == "custom"          → download from S3, load CSV
-      dataset_type == "synthetic-*"     → generate synthetic data
-      anything else                     → generate synthetic data
-
-    Decision: 80/20 train/val split for S3 datasets.
-    Decision: synthetic uses 10k rows for CPU speed (not full 500k).
+    Routing:
+      dataset_type == "custom"      → download from S3, load CSV
+      dataset_type == "synthetic-*" → generate synthetic data
     """
     dataset_type = cfg.get("dataset_type", "synthetic-500k")
     feat         = int(cfg["input_dim"])
@@ -284,27 +299,19 @@ def make_dataset(cfg: dict):
                 "dataset_type=custom but s3_dataset_path is empty in job_config.json"
             )
         print(f"[data] Loading custom dataset from S3: {s3_path}")
-
         local_dir  = "/tmp/dataset"
         csv_files  = _download_s3_dataset(s3_path, local_dir)
         X_t, y_t   = _load_csv_dataset(csv_files, cfg)
-
-        # 80/20 split
         n          = len(X_t)
         n_train    = int(n * 0.8)
         indices    = torch.randperm(n)
         X_tr, y_tr = X_t[indices[:n_train]],  y_t[indices[:n_train]]
         X_va, y_va = X_t[indices[n_train:]], y_t[indices[n_train:]]
-
         print(f"[data] Split: {len(X_tr)} train / {len(X_va)} val")
-
     else:
-        # Synthetic data — use 10k rows regardless of synthetic_rows config
-        # to keep CPU training time reasonable
         n_tr = 10_000
         n_va =  2_000
-        print(f"[data] Synthetic: {n_tr} train / {n_va} val | "
-              f"feat={feat} cls={cls}")
+        print(f"[data] Synthetic: {n_tr} train / {n_va} val | feat={feat} cls={cls}")
         torch.manual_seed(42)
         X_tr = torch.randn(n_tr, feat)
         y_tr = torch.randint(0, cls, (n_tr,))
@@ -345,8 +352,7 @@ def train(cfg: dict):
     print(f"  lr={cfg['lr']}  hidden={cfg['hidden_dim']}  "
           f"dropout={cfg['dropout']}  batch={cfg['batch_size']}")
     print(f"  epochs={cfg['epochs']}  ckpt_every={cfg['ckpt_every']}")
-    print(f"  budget=${cfg['max_budget']}  "
-          f"price=${cfg['price_usd_hr']}/hr")
+    print(f"  budget=${cfg['max_budget']}  price=${cfg['price_usd_hr']}/hr")
     print(f"  RESUME_STEP={os.environ.get('RESUME_STEP','0')}")
     print("="*60 + "\n")
 
@@ -358,18 +364,15 @@ def train(cfg: dict):
     optimizer = optim.Adam(model.parameters(), lr=float(cfg["lr"]))
     criterion = nn.CrossEntropyLoss()
 
-    # ── CheckpointEngine ─────────────────────────────────────────
-    # Decision: init engine AFTER model so load() can restore weights
+    # ── CheckpointEngine ──────────────────────────────────────────
     from checkpoint.engine import CheckpointEngine
     engine = CheckpointEngine(job_id=cfg["job_id"])
 
     # ── Resume if RESUME_STEP > 0 ─────────────────────────────────
-    # engine.load() downloads checkpoint_latest.pt from GCS (S3 fallback)
-    # restores model.state_dict() + optimizer.state_dict() in-place
     meta = engine.load(model, optimizer)
     if meta:
-        start_epoch  = meta["epoch"]       # resume from this epoch
-        global_step  = meta["step"]        # exact step count restored
+        start_epoch  = meta["epoch"]
+        global_step  = meta["step"]
         last_loss    = meta["loss"]
         resumed_from = meta["step"]
         print(f"[resume] Restored to epoch={start_epoch} step={global_step}\n")
@@ -397,25 +400,74 @@ def train(cfg: dict):
 
     best_val_acc = 0.0
     avg_val_loss = last_loss
+    avg_tr_loss  = last_loss
     preempted    = False
 
     # ── Epoch loop ────────────────────────────────────────────────
     for epoch in range(start_epoch, int(cfg["epochs"]) + 1):
 
-        # Pre-epoch preemption check
+        # ── Check for server-side command at top of every epoch ───
+        # server.py writes job_command.json; we consume it once here.
+        cmd = check_command(cfg)
+        if cmd == "migrate":
+            print(f"[command] migrate — saving checkpoint and exiting")
+            asyncio.run(engine.save(
+                model, optimizer,
+                epoch=epoch, step=global_step, loss=avg_val_loss,
+                extra_state={
+                    "task_name":         cfg["task_name"],
+                    "status":            "preempted",
+                    "total_epochs":      cfg["epochs"],
+                    "accuracy":          best_val_acc,
+                    "best_val_acc":      best_val_acc,
+                    "resumed_from":      resumed_from,
+                    "migration_count":   cfg.get("migration_count", 0),
+                    "preemption_source": "server_command_migrate",
+                    **runtime_stats(cfg, start_time),
+                }
+            ))
+            preempted = True
+            break
+
+        elif cmd == "stop":
+            print(f"[command] stop — saving final checkpoint")
+            asyncio.run(engine.write_terminal_state(
+                epoch=epoch, step=global_step, loss=avg_val_loss,
+                extra={
+                    "task_name":       cfg["task_name"],
+                    "status":          "done",
+                    "total_epochs":    cfg["epochs"],
+                    "accuracy":        best_val_acc,
+                    "best_val_acc":    best_val_acc,
+                    "train_loss":      avg_tr_loss,
+                    "resumed_from":    resumed_from,
+                    "migration_count": cfg.get("migration_count", 0),
+                    **runtime_stats(cfg, start_time),
+                }
+            ))
+            break
+
+        elif cmd == "reduce_lr":
+            for g in optimizer.param_groups:
+                g["lr"] *= 0.1
+            new_lr = optimizer.param_groups[0]["lr"]
+            print(f"[command] reduce_lr — new lr={new_lr:.6f}")
+            # Continue training — do not break
+
+        # ── Pre-epoch preemption check ────────────────────────────
         if check_preemption():
             print(f"\n[!!!] PREEMPTION before epoch {epoch} step {global_step}")
             asyncio.run(engine.save(
                 model, optimizer,
                 epoch=epoch, step=global_step, loss=avg_val_loss,
                 extra_state={
-                    "task_name":        cfg["task_name"],
-                    "status":           "preempted",
-                    "total_epochs":     cfg["epochs"],
-                    "accuracy":         best_val_acc,
-                    "best_val_acc":     best_val_acc,
-                    "resumed_from":     resumed_from,
-                    "migration_count":  cfg.get("migration_count", 0),
+                    "task_name":         cfg["task_name"],
+                    "status":            "preempted",
+                    "total_epochs":      cfg["epochs"],
+                    "accuracy":          best_val_acc,
+                    "best_val_acc":      best_val_acc,
+                    "resumed_from":      resumed_from,
+                    "migration_count":   cfg.get("migration_count", 0),
                     "preemption_source": "gcp_metadata_pre_epoch",
                     **runtime_stats(cfg, start_time),
                 }
@@ -423,7 +475,7 @@ def train(cfg: dict):
             preempted = True
             break
 
-        # Pre-epoch budget check
+        # ── Pre-epoch budget check ────────────────────────────────
         if check_budget(cfg, start_time):
             stats = runtime_stats(cfg, start_time)
             print(f"\n[budget] Limit reached: ${stats['cost_usd']:.4f} "
@@ -453,9 +505,6 @@ def train(cfg: dict):
         for i, (X, y) in enumerate(train_loader):
 
             # Preemption check every 10 batches
-            # Decision: every 10 batches gives ~3-5s polling frequency
-            # on a CPU VM with 10k dataset. GCP gives 30s warning
-            # so we have 6+ polls before VM dies.
             if i % 10 == 0 and check_preemption():
                 print(f"\n[!!!] PREEMPTION mid-epoch "
                       f"epoch={epoch} batch={i} step={global_step}")
@@ -492,17 +541,13 @@ def train(cfg: dict):
 
             # Periodic checkpoint every ckpt_every steps
             if global_step % int(cfg["ckpt_every"]) == 0:
-                avg  = run_loss / (i + 1)
-                acc  = correct / total
+                avg   = run_loss / (i + 1)
+                acc   = correct / total
                 stats = runtime_stats(cfg, start_time)
                 print(f"  e{epoch:3d} | step {global_step:5d} | "
                       f"loss {avg:.4f} | acc {acc:.3f} | "
                       f"${stats['cost_usd']:.4f}")
 
-                # engine.save() writes:
-                #   step_{N:08d}.pt  → GCS + S3
-                #   checkpoint_latest.pt → GCS + S3
-                #   job_state.json   → GCS only
                 asyncio.run(engine.save(
                     model, optimizer,
                     epoch=epoch, step=global_step, loss=avg,
@@ -545,7 +590,7 @@ def train(cfg: dict):
               f"val_acc={val_acc:.3f} best={best_val_acc:.3f} "
               f"${stats['cost_usd']:.4f}")
 
-        # End-of-epoch checkpoint via engine
+        # End-of-epoch checkpoint
         asyncio.run(engine.save(
             model, optimizer,
             epoch=epoch, step=global_step, loss=avg_val_loss,
@@ -562,7 +607,7 @@ def train(cfg: dict):
             }
         ))
 
-    # ── Terminal states ───────────────────────────────────────────
+    # ── Terminal state ────────────────────────────────────────────
     if not preempted:
         stats = runtime_stats(cfg, start_time)
         print(f"\n{'='*60}")
@@ -571,7 +616,6 @@ def train(cfg: dict):
         print(f"  Cost:  ${stats['cost_usd']:.4f}")
         print(f"{'='*60}\n")
 
-        # Final state — status=done
         asyncio.run(engine.write_terminal_state(
             epoch=int(cfg["epochs"]), step=global_step,
             loss=avg_val_loss,

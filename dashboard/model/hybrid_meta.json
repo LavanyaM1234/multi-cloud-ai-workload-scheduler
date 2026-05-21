@@ -1,0 +1,11 @@
+{
+  "model_type": "LSTM+XGBoost Hybrid",
+  "lstm_out_dim": 8,
+  "sequence_len": 10,
+  "n_features": 29,
+  "hybrid_features": 37,
+  "test_roc_auc": 0.9999999999999999,
+  "test_f1": 1.0,
+  "test_precision": 1.0,
+  "test_recall": 1.0
+}

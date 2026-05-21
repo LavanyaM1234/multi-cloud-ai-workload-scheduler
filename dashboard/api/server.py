@@ -27,12 +27,14 @@ New endpoints:
     POST /api/jobs/submit        → submit new job → create GCP VM
     POST /api/jobs/resume        → manually resume a preempted job
     GET  /api/jobs/<job_id>      → single job state
+    GET  /api/risk               → LSTM + XGBoost preemption risk scores
 """
 
 import os
 import sys
 import json
 import time
+import logging
 import threading
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request
@@ -40,7 +42,18 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from flask import render_template
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 load_dotenv()
+
+# ── Logging setup ─────────────────────────────────────────────────
+# Print logs go to stdout so you can see them in the terminal where
+# you run `python api/server.py`. Level=DEBUG shows all model steps.
+logging.basicConfig(
+    level  = logging.DEBUG,
+    format = "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt= "%H:%M:%S",
+)
+log = logging.getLogger("server")
 
 app = Flask(
     __name__,
@@ -56,10 +69,7 @@ TABLE       = os.getenv("BIGQUERY_TABLE",          "price_history")
 GCS_BUCKET  = os.getenv("CHECKPOINT_GCS_BUCKET",   "")
 GCP_ZONE    = os.getenv("GCP_ZONE",                "us-central1-a")
 
-# How often the poller checks for preempted jobs (seconds)
 POLLER_INTERVAL = 30
-
-# How many times we allow a job to be auto-migrated before giving up
 MAX_MIGRATIONS  = 5
 
 
@@ -78,14 +88,12 @@ def get_gcs_client():
 
 
 def gcs_read_json(path):
-    """Read a JSON file from GCS bucket."""
     client = get_gcs_client()
     blob   = client.bucket(GCS_BUCKET).blob(path)
     return json.loads(blob.download_as_text())
 
 
 def gcs_write_json(path, data):
-    """Write a dict as JSON to GCS bucket."""
     client = get_gcs_client()
     client.bucket(GCS_BUCKET).blob(path).upload_from_string(
         json.dumps(data, indent=2), content_type="application/json"
@@ -93,10 +101,6 @@ def gcs_write_json(path, data):
 
 
 def gcs_list_job_states():
-    """
-    List all job_state.json files in GCS.
-    Returns list of parsed state dicts.
-    """
     if not GCS_BUCKET:
         return []
     try:
@@ -107,13 +111,13 @@ def gcs_list_job_states():
             if blob.name.endswith("job_state.json"):
                 try:
                     state = json.loads(blob.download_as_text())
-                    # Compute progress % from epoch/total_epochs
                     epoch        = state.get("epoch", 0)
                     total_epochs = state.get("total_epochs", 50)
                     state["progress_pct"] = min(
                         99, round((epoch / max(total_epochs, 1)) * 100)
                     )
                     states.append(state)
+                    print(state)
                 except Exception:
                     pass
         return states
@@ -123,29 +127,14 @@ def gcs_list_job_states():
 
 
 # ══════════════════════════════════════════════════════════════════
-# PREEMPTION POLLER  — runs in background thread
+# PREEMPTION POLLER
 # ══════════════════════════════════════════════════════════════════
 
 class PreemptionPoller(threading.Thread):
-    """
-    Background thread that polls GCS job states every POLLER_INTERVAL
-    seconds. When it finds a job with status=preempted it:
-
-      1. Reads migration_count from job_config.json
-      2. If under MAX_MIGRATIONS → calls selector + launcher to
-         relaunch on cheapest available cloud
-      3. If over limit → marks job as failed
-
-    This is what makes migration fully automatic — the dashboard user
-    just sees the job go from "preempted" → "migrating" → "running".
-    """
-
     def __init__(self):
-        super().__init__(daemon=True)   # daemon=True: dies when Flask dies
+        super().__init__(daemon=True)
         self._stop_event = threading.Event()
-        # Track jobs we've already dispatched a resume for, so we don't
-        # double-launch if the poller fires before job_state updates
-        self._resuming = set()          # set of job_ids currently being resumed
+        self._resuming   = set()
 
     def stop(self):
         self._stop_event.set()
@@ -162,45 +151,30 @@ class PreemptionPoller(threading.Thread):
     def _poll(self):
         if not GCS_BUCKET:
             return
-
         states = gcs_list_job_states()
         for state in states:
             job_id = state.get("job_id")
             status = state.get("status")
-
-            # Only act on preempted jobs we haven't already picked up
             if status == "preempted" and job_id not in self._resuming:
                 self._resuming.add(job_id)
                 print(f"\n[poller] Detected preempted job: {job_id}")
-                # Run migration in its own thread so poller doesn't block
-                t = threading.Thread(
-                    target=self._migrate,
-                    args=(job_id, state),
-                    daemon=True
-                )
+                t = threading.Thread(target=self._migrate, args=(job_id, state), daemon=True)
                 t.start()
-
-            # Clean up _resuming set once job is back to running/done
-            if status in ("running", "done", "budget_exceeded",
-                          "launch_failed") and job_id in self._resuming:
+            if status in ("running", "done", "budget_exceeded", "launch_failed") \
+                    and job_id in self._resuming:
                 self._resuming.discard(job_id)
 
     def _migrate(self, job_id, state):
-        """Called in its own thread. Relaunches the job on a new cloud."""
         try:
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
             from scheduler.selector import pick_best_cloud
             from scheduler.launcher import resume_job
-
-            # Read full config to get migration count + hyperparams
             try:
                 config = gcs_read_json(f"checkpoints/{job_id}/job_config.json")
             except Exception:
                 config = {}
-
             migration_count = config.get("migration_count", 0)
             if migration_count >= MAX_MIGRATIONS:
-                print(f"[poller] Job {job_id} hit migration limit ({MAX_MIGRATIONS}) — marking failed")
+                print(f"[poller] Job {job_id} hit migration limit — marking failed")
                 gcs_write_json(f"checkpoints/{job_id}/job_state.json", {
                     **state,
                     "status":     "failed",
@@ -209,52 +183,66 @@ class PreemptionPoller(threading.Thread):
                 })
                 self._resuming.discard(job_id)
                 return
-
-            resume_step = state.get("step", 0)
-            prev_cloud  = state.get("cloud", "gcp")
-
-            print(f"[poller] Migrating {job_id}: step={resume_step} "
-                  f"from={prev_cloud} migration={migration_count+1}/{MAX_MIGRATIONS}")
-
-            # Pick best cloud for the resume
-            # Pass budget remaining = original_budget - cost_so_far
+            resume_step     = state.get("step", 0)
+            prev_cloud      = state.get("cloud", "gcp")
             cost_so_far     = float(state.get("cost_usd", 0))
             original_budget = float(config.get("max_budget", 2.0))
             remaining       = max(0.10, original_budget - cost_so_far)
-
-            job_spec = {
-                "job_id":       job_id,
-                "max_budget":   remaining,
+            decision        = pick_best_cloud({
+                "job_id": job_id, "max_budget": remaining,
                 "deadline_hrs": config.get("deadline_hrs", 8.0),
-            }
-            decision = pick_best_cloud(job_spec)
-
-            result = resume_job(
-                job_id      = job_id,
-                resume_step = resume_step,
-                prev_cloud  = prev_cloud,
-                decision    = decision,
-            )
-
+            })
+            result = resume_job(job_id=job_id, resume_step=resume_step,
+                                prev_cloud=prev_cloud, decision=decision)
             if result.get("launched"):
-                print(f"[poller] ✓ Job {job_id} relaunched on "
-                      f"{result['cloud']} / {result.get('instance_name','?')}")
+                print(f"[poller] ✓ {job_id} relaunched on {result['cloud']}")
             else:
-                print(f"[poller] ✗ Job {job_id} relaunch failed: {result.get('error')}")
+                print(f"[poller] ✗ {job_id} relaunch failed: {result.get('error')}")
                 self._resuming.discard(job_id)
-
         except Exception as e:
             print(f"[poller] _migrate error for {job_id}: {e}")
             self._resuming.discard(job_id)
 
 
-# ── Start poller when module loads ────────────────────────────────
 _poller = PreemptionPoller()
 _poller.start()
 
 
 # ══════════════════════════════════════════════════════════════════
-# PRICE ENDPOINTS  (unchanged from original)
+# RISK MODEL — load at startup with verbose print logs
+# ══════════════════════════════════════════════════════════════════
+
+from risk.predictor import load_models, score_instance
+
+def _load_risk_models_bg():
+    """
+    Load LSTM + XGBoost from local disk in a background thread.
+    Verbose prints so you can see every step in the terminal.
+    """
+    print("\n" + "─"*55)
+    print("[risk] ── Model load starting ──")
+    print(f"[risk]   models/     → dashboard/model/")
+    print(f"[risk]   model_data/ → dashboard/model_data/")
+    try:
+        load_models()
+        # load_models() logs its own lines via logging — these appear
+        # after it returns to confirm server is ready to score
+        print("[risk] ── Model load complete — /api/risk endpoint is live ──")
+        print("─"*55 + "\n")
+    except FileNotFoundError as e:
+        print(f"\n[risk] ✗ MISSING FILES:\n{e}")
+        print("[risk]   /api/risk will return 500 until files are present")
+        print("─"*55 + "\n")
+    except Exception as e:
+        print(f"[risk] ✗ Load failed ({type(e).__name__}): {e}")
+        print("[risk]   /api/risk will return 500")
+        print("─"*55 + "\n")
+
+threading.Thread(target=_load_risk_models_bg, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════════════════
+# PRICE ENDPOINTS
 # ══════════════════════════════════════════════════════════════════
 
 @app.route("/")
@@ -273,8 +261,7 @@ def price_history():
                        AVG(price_usd_per_hr) AS avg_price
                 FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
                 WHERE collected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE)
-                  AND preempted = FALSE
-                  AND gpu_class != 'none'
+                  AND preempted = FALSE AND gpu_class != 'none'
                 GROUP BY cloud, minute
             )
             SELECT cloud, minute, avg_price FROM buckets ORDER BY minute ASC
@@ -291,12 +278,9 @@ def price_history():
         def series(cloud):
             d = by_cloud.get(cloud, {})
             return [d.get(t) for t in timestamps]
-        return jsonify({
-            "timestamps": timestamps,
-            "aws":        series("aws"),
-            "gcp":        series("gcp"),
-            "azure":      series("azure"),
-        })
+        return jsonify({"timestamps": timestamps,
+                        "aws": series("aws"), "gcp": series("gcp"),
+                        "azure": series("azure")})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -421,29 +405,16 @@ def health():
 
 
 # ══════════════════════════════════════════════════════════════════
-# JOB ENDPOINTS  (new)
+# JOB ENDPOINTS
 # ══════════════════════════════════════════════════════════════════
 
 @app.route("/api/jobs")
 def get_jobs():
-    """
-    Return all job states from GCS.
-    Dashboard polls this every 60s to show live progress.
-
-    Response: list of job state dicts, sorted running-first.
-    Each dict has:
-        job_id, task_name, status, epoch, total_epochs,
-        step, loss, accuracy, elapsed_hrs, cost_usd,
-        cloud, instance, progress_pct, updated_at,
-        resumed_from, migration_count (if migrated)
-    """
     if not GCS_BUCKET:
         return jsonify([])
     try:
         states = gcs_list_job_states()
-
-        # Sort: running/migrating first, then queued, then done/failed
-        order = {
+        order  = {
             "running": 0, "migrating": 1, "queued": 2,
             "preempted": 3, "paused": 4,
             "done": 5, "budget_exceeded": 6,
@@ -460,11 +431,10 @@ def get_jobs():
 
 @app.route("/api/jobs/<job_id>")
 def get_job(job_id):
-    """Single job state — used by dashboard to poll a specific job."""
     if not GCS_BUCKET:
         return jsonify({"error": "GCS_BUCKET not configured"}), 500
     try:
-        state = gcs_read_json(f"checkpoints/{job_id}/job_state.json")
+        state        = gcs_read_json(f"checkpoints/{job_id}/job_state.json")
         epoch        = state.get("epoch", 0)
         total_epochs = state.get("total_epochs", 50)
         state["progress_pct"] = min(99, round((epoch / max(total_epochs, 1)) * 100))
@@ -475,61 +445,33 @@ def get_job(job_id):
 
 @app.route("/api/jobs/submit", methods=["POST"])
 def submit_job():
-    """
-    Non-blocking job submit:
-      1. selector.pick_best_cloud() → decision (fast, <1ms)
-      2. Write job_config.json + job_state(queued) to GCS (fast, ~1s)
-      3. Spin up background thread to create VM (slow, ~90s)
-      4. Return immediately with job_id + decision — frontend shows
-         job card with status=queued right away
-
-    The dashboard then polls /api/jobs every 60s (and /api/jobs/<id>
-    every 10s) — once the VM boots and train.py runs it will update
-    job_state.json to status=running with live epoch/loss.
-
-    Why non-blocking: VM creation blocks for ~90-120s via
-    operation.result(). Keeping Flask blocked that long causes the
-    frontend fetch to hit its timeout and show "signal timed out".
-    """
     try:
         data   = request.json or {}
         job_id = data.get("job_id") or f"job-{int(time.time())}"
-
-        # ── Import scheduler modules ───────────────────────────────
         try:
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
             from scheduler.selector import pick_best_cloud
-            from scheduler.launcher import (launch_job,
-                                            _write_job_config,
+            from scheduler.launcher import (_write_job_config,
                                             _write_initial_state,
                                             _upload_trainer_files)
         except ImportError as e:
             return jsonify({"error": f"Scheduler module not found: {e}"}), 500
 
-        # ── Pick cloud (fast) ──────────────────────────────────────
         decision = pick_best_cloud(data)
-
-        # ── Upload trainer files + write GCS state (done inline) ──
-        # These are fast (~1-2s) and must complete before VM boots.
         try:
             _upload_trainer_files()
         except Exception as e:
             return jsonify({"error": f"Trainer upload failed: {e}",
                             "launched": False, "job_id": job_id}), 500
 
-        # ── Determine dataset config ───────────────────────────────
         dataset_type    = data.get("dataset", "synthetic-500k")
         s3_dataset_path = data.get("s3_dataset_path", "").strip()
         dataset_name    = data.get("dataset_name", "").strip()
 
         if dataset_type == "custom" and not s3_dataset_path:
-            return jsonify({
-                "error": "Custom dataset selected but no S3 path provided.",
-                "launched": False, "job_id": job_id
-            }), 400
+            return jsonify({"error": "Custom dataset selected but no S3 path provided.",
+                            "launched": False, "job_id": job_id}), 400
 
         synthetic_rows = {"synthetic-500k": 500_000, "synthetic-100k": 100_000}
-
         config = {
             "job_id":           job_id,
             "task_name":        data.get("task_name",    "Untitled"),
@@ -549,17 +491,14 @@ def submit_job():
             "zone":             decision["zone"],
             "price_usd_hr":     decision["price_usd_hr"],
             "gcs_bucket":       GCS_BUCKET,
-            # ── Dataset ───────────────────────────────────────────
             "dataset_type":       dataset_type,
             "s3_dataset_path":    s3_dataset_path,
             "dataset_name":       dataset_name or dataset_type,
             "synthetic_rows":     synthetic_rows.get(dataset_type, 10_000),
-            # ── AWS creds injected into VM metadata by launcher ───
             "aws_access_key_id":     os.getenv("AWS_ACCESS_KEY_ID",     ""),
             "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", ""),
             "aws_default_region":    os.getenv("AWS_DEFAULT_REGION",    "us-east-1"),
             "checkpoint_s3_bucket":  os.getenv("CHECKPOINT_S3_BUCKET",  ""),
-            # ── Migration tracking ────────────────────────────────
             "resume_from_step": 0,
             "migration_count":  0,
         }
@@ -570,123 +509,278 @@ def submit_job():
 
         _write_initial_state(job_id, config, status="queued")
 
-        # ── Launch VM in background thread (slow ~90s) ─────────────
-        # We don't wait for it. The poller + /api/jobs polling handles
-        # surfacing the result to the dashboard once VM is up.
         def _bg_launch():
             try:
                 from scheduler.launcher import _create_vm, _write_failed_state
                 vm = _create_vm(job_id, decision["instance_type"],
                                 resume_step=0, prev_cloud="")
-                print(f"[submit] ✓ VM created in background: "
-                      f"{vm['instance_name']}")
+                print(f"[submit] ✓ VM created: {vm['instance_name']}")
             except Exception as e:
-                print(f"[submit] ✗ Background VM creation failed: {e}")
+                print(f"[submit] ✗ VM creation failed: {e}")
                 try:
                     from scheduler.launcher import _write_failed_state
                     _write_failed_state(job_id, str(e))
                 except Exception:
                     pass
 
-        t = threading.Thread(target=_bg_launch, daemon=True)
-        t.start()
+        threading.Thread(target=_bg_launch, daemon=True).start()
 
-        # ── Return immediately ─────────────────────────────────────
-        return jsonify({
-            **decision,
-            "job_id":        job_id,
-            "launched":      True,
-            "status":        "queued",
-            "message":       "VM creation started in background (~90s to boot). "
-                             "Job will appear as running once VM is up.",
-        })
-
+        return jsonify({**decision, "job_id": job_id, "launched": True,
+                        "status": "queued",
+                        "message": "VM creation started (~90s to boot)."})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/jobs/resume", methods=["POST"])
 def manual_resume():
-    """
-    Manually trigger a resume for a preempted job.
-    Useful for debugging or if the auto-poller missed it.
-
-    Request body:
-        job_id       — required
-        resume_step  — optional, defaults to step from job_state.json
-    """
     try:
-        data    = request.json or {}
-        job_id  = data.get("job_id")
+        data   = request.json or {}
+        job_id = data.get("job_id")
         if not job_id:
             return jsonify({"error": "job_id required"}), 400
-
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
         from scheduler.selector import pick_best_cloud
         from scheduler.launcher import resume_job
-
-        # Read current state
         try:
             state = gcs_read_json(f"checkpoints/{job_id}/job_state.json")
         except Exception:
             return jsonify({"error": f"job_state.json not found for {job_id}"}), 404
-
         resume_step = data.get("resume_step") or state.get("step", 0)
         prev_cloud  = state.get("cloud", "gcp")
-
-        # Read config for budget info
         try:
             config = gcs_read_json(f"checkpoints/{job_id}/job_config.json")
         except Exception:
             config = {}
-
         cost_so_far = float(state.get("cost_usd", 0))
         remaining   = max(0.10, float(config.get("max_budget", 2.0)) - cost_so_far)
-
-        decision = pick_best_cloud({
-            "job_id":       job_id,
-            "max_budget":   remaining,
-            "deadline_hrs": config.get("deadline_hrs", 8.0),
-        })
-
-        result = resume_job(
-            job_id      = job_id,
-            resume_step = resume_step,
-            prev_cloud  = prev_cloud,
-            decision    = decision,
-        )
-
-        return jsonify({**result, "job_id": job_id,
-                        "manual_resume": True,
+        decision    = pick_best_cloud({"job_id": job_id, "max_budget": remaining,
+                                       "deadline_hrs": config.get("deadline_hrs", 8.0)})
+        result      = resume_job(job_id=job_id, resume_step=resume_step,
+                                 prev_cloud=prev_cloud, decision=decision)
+        return jsonify({**result, "job_id": job_id, "manual_resume": True,
                         "resumed_from_step": resume_step})
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# ══════════════════════════════════════════════════════════════════
-# POLLER STATUS  — useful for debugging
-# ══════════════════════════════════════════════════════════════════
-
 @app.route("/api/poller/status")
 def poller_status():
-    """Shows what jobs the poller is currently tracking."""
     return jsonify({
-        "running":        _poller.is_alive(),
-        "interval_sec":   POLLER_INTERVAL,
-        "max_migrations": MAX_MIGRATIONS,
+        "running":            _poller.is_alive(),
+        "interval_sec":       POLLER_INTERVAL,
+        "max_migrations":     MAX_MIGRATIONS,
         "currently_resuming": list(_poller._resuming),
-        "gcs_bucket":     GCS_BUCKET or "(not configured)",
+        "gcs_bucket":         GCS_BUCKET or "(not configured)",
     })
+
+
+# ══════════════════════════════════════════════════════════════════
+# RISK ENDPOINT — verbose print logs so you can trace every step
+# ══════════════════════════════════════════════════════════════════
+
+@app.route("/api/risk")
+def risk_scores():
+    """
+    Returns preemption risk score 0–1 for each active instance.
+    Prints a detailed log for every instance scored so you can see
+    exactly what the model is doing in the server terminal.
+
+    Terminal output per request looks like:
+        ─────────────────────────────────────────
+        [risk] /api/risk called — 14:22:07
+        [risk] BQ query → 5 distinct instances
+        [risk] ── Scoring: aws / g4dn.xlarge / us-east-1 / us-east-1a
+        [risk]   BQ rows fetched : 10
+        [risk]   Feature cols    : ['price_usd_per_hr', 'hour_of_day', ...]
+        [risk]   Raw X shape     : (10, 12)
+        [risk]   Scaled X shape  : (10, 12)
+        [risk]   X_seq shape     : (1, 10, 12)
+        [risk]   X_flat shape    : (12,)
+        [risk]   LSTM out shape  : (8,)
+        [risk]   X_hybrid shape  : (1, 20)
+        [risk]   XGB proba       : [0.88  0.12]   ← [preempted, safe]
+        [risk]   RISK SCORE      : 0.1200
+        [risk] ── Scoring: gcp / g2-standard-4 / us-central1 / us-central1-a
+        ...
+        [risk] Results (sorted high→low risk):
+        [risk]   1. aws/p3.2xlarge    risk=0.8100  ← HIGH
+        [risk]   2. aws/g5.xlarge     risk=0.5400  ← MED
+        [risk]   3. azure/NC4as_T4_v3 risk=0.4700  ← MED
+        [risk]   4. gcp/g2-standard-4 risk=0.2300  ← LOW
+        [risk]   5. aws/g4dn.xlarge   risk=0.1200  ← LOW
+        ─────────────────────────────────────────
+    """
+    import numpy as np
+
+    sep = "─" * 55
+    ts  = datetime.now().strftime("%H:%M:%S")
+    print(f"\n{sep}")
+    print(f"[risk] /api/risk called — {ts}")
+
+    try:
+        bq = get_bq_client()
+
+        # ── Step 1: fetch distinct active instances ────────────────
+        query = f"""
+            SELECT DISTINCT cloud, region, availability_zone, instance_type
+            FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
+            WHERE collected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+              AND preempted = FALSE
+            LIMIT 20
+        """
+        instances = list(bq.query(query))
+        print(f"[risk] BQ query → {len(instances)} distinct instance(s)")
+
+        if not instances:
+            print(f"[risk] No instances found in last 1 hour — returning []")
+            print(sep + "\n")
+            return jsonify([])
+
+        results = []
+
+        for row in instances:
+            cloud         = row["cloud"]
+            region        = row["region"]
+            az            = row["availability_zone"]
+            instance_type = row["instance_type"]
+
+            print(f"[risk] ── Scoring: {cloud} / {instance_type} / {region} / {az}")
+
+            try:
+                # ── Step 2: call score_instance with extra prints ──
+                risk = _score_with_logs(
+                    cloud=cloud, region=region, az=az,
+                    instance_type=instance_type, bq_client=bq,
+                )
+                results.append({
+                    "cloud":         cloud,
+                    "instance_type": instance_type,
+                    "region":        region,
+                    "az":            az,
+                    "risk":          round(risk, 4),
+                })
+
+            except Exception as e:
+                print(f"[risk]   ✗ FAILED: {type(e).__name__}: {e}")
+
+        # ── Step 3: sort and print summary ────────────────────────
+        results.sort(key=lambda x: x["risk"], reverse=True)
+        print(f"[risk] Results (sorted high→low risk):")
+        for i, r in enumerate(results, 1):
+            level = "HIGH" if r["risk"] >= 0.6 else "MED" if r["risk"] >= 0.3 else "LOW"
+            print(f"[risk]   {i}. {r['cloud']}/{r['instance_type']:<20} "
+                  f"risk={r['risk']:.4f}  ← {level}")
+
+        print(sep + "\n")
+        return jsonify(results)
+
+    except Exception as e:
+        print(f"[risk] ✗ Endpoint error: {type(e).__name__}: {e}")
+        print(sep + "\n")
+        return jsonify({"error": str(e)}), 500
+
+
+"""
+Replace the existing _score_with_logs() function in api/server.py
+with this version. It uses the same fix as predictor.py:
+  - fetch only RAW columns from BQ
+  - run _engineer_features() to compute derived features
+  - then pass to LSTM + XGBoost
+
+Paste this function BEFORE the /api/risk route in server.py.
+"""
+
+def _score_with_logs(cloud, region, az, instance_type, bq_client) -> float:
+    """
+    Verbose version of score_instance() used by /api/risk endpoint.
+    Prints every intermediate tensor shape so you can trace the full pipeline.
+    """
+    import torch
+    import numpy as np
+
+    from risk.predictor import (
+        load_models, _fetch_raw_rows, _engineer_features,
+        FEATURE_COLS, SEQUENCE_LEN,
+        _lstm, _xgb, _scaler, _feat_cols,
+    )
+
+    load_models()  # no-op if already loaded
+
+    sep = "─" * 45
+
+    # ── Step 1: fetch RAW rows from BQ ───────────────────────────
+    # ONLY selects columns that exist in the table.
+    # spot_ratio, price_lag_*, hour etc are NOT in BQ — computed below.
+    print(f"[risk]   Fetching RAW rows from BQ...")
+    df_raw = _fetch_raw_rows(cloud, region, az, instance_type, bq_client)
+
+    if df_raw.empty or len(df_raw) < SEQUENCE_LEN:
+        n = len(df_raw) if not df_raw.empty else 0
+        print(f"[risk]   ⚠ Not enough rows ({n}/{SEQUENCE_LEN}) — returning 0.5")
+        return 0.5
+
+    print(f"[risk]   Raw rows       : {len(df_raw)}")
+    print(f"[risk]   Raw columns    : {list(df_raw.columns)}")
+
+    # ── Step 2: engineer features (mirrors 01_data_prep.py) ───────
+    print(f"[risk]   Engineering features...")
+    df_eng = _engineer_features(df_raw)
+
+    feat_cols = list(_feat_cols) if _feat_cols is not None else FEATURE_COLS
+    missing = [c for c in feat_cols if c not in df_eng.columns]
+    if missing:
+        print(f"[risk]   ✗ Missing after engineering: {missing} — returning 0.5")
+        return 0.5
+
+    print(f"[risk]   Feature cols   : {feat_cols}")
+    print(f"[risk]   Engineered rows: {len(df_eng)}")
+
+    # ── Step 3: build feature matrix ─────────────────────────────
+    X_raw = df_eng[feat_cols].values.astype(float)
+    print(f"[risk]   Raw X shape    : {X_raw.shape}")
+    print(f"[risk]   Raw X last row : {X_raw[-1].round(4).tolist()}")
+
+    # ── Step 4: scale ─────────────────────────────────────────────
+    X_scaled = _scaler.transform(X_raw)
+    print(f"[risk]   Scaled X shape : {X_scaled.shape}")
+    print(f"[risk]   Scaled last row: {X_scaled[-1].round(4).tolist()}")
+
+    X_seq  = X_scaled[-SEQUENCE_LEN:]   # (SEQUENCE_LEN, n_features)
+    X_flat = X_scaled[-1]               # (n_features,)
+    print(f"[risk]   X_seq shape    : {X_seq.shape}")
+    print(f"[risk]   X_flat shape   : {X_flat.shape}")
+
+    # ── Step 5: LSTM ──────────────────────────────────────────────
+    seq_tensor = torch.tensor(X_seq, dtype=torch.float32).unsqueeze(0)
+    print(f"[risk]   seq_tensor     : {tuple(seq_tensor.shape)}")
+
+    with torch.no_grad():
+        lstm_feats, lstm_logit = _lstm(seq_tensor)
+    lstm_feats = lstm_feats.squeeze(0).numpy()
+    print(f"[risk]   LSTM feats     : shape={lstm_feats.shape}  vals={lstm_feats.round(4).tolist()}")
+    print(f"[risk]   LSTM logit     : {lstm_logit.item():.4f}")
+
+    # ── Step 6: XGBoost ───────────────────────────────────────────
+    X_hybrid = np.hstack([lstm_feats, X_flat]).reshape(1, -1)
+    print(f"[risk]   X_hybrid shape : {X_hybrid.shape}  (LSTM_OUT + tabular)")
+
+    proba = _xgb.predict_proba(X_hybrid)[0]
+    risk  = float(proba[1])
+    print(f"[risk]   XGB proba      : {proba.round(4).tolist()}  [not_preempted, preempted]")
+    print(f"[risk]   RISK SCORE     : {risk:.4f}")
+
+    return round(risk, 4)
 
 
 # ══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print(f"Starting API server")
+    print(f"\n{'═'*55}")
+    print(f"  Multi-Cloud Scheduler — API server")
     print(f"  Project  : {PROJECT_ID}")
     print(f"  BigQuery : {PROJECT_ID}.{DATASET}.{TABLE}")
     print(f"  GCS      : {GCS_BUCKET or '(not set — job features disabled)'}")
-    print(f"  Poller   : every {POLLER_INTERVAL}s, max {MAX_MIGRATIONS} migrations")
+    print(f"  Poller   : every {POLLER_INTERVAL}s · max {MAX_MIGRATIONS} migrations")
+    print(f"{'═'*55}\n")
     app.run(host="0.0.0.0", port=5050, debug=True, use_reloader=False)
-    # use_reloader=False — reloader would start two poller threads
+    # use_reloader=False — prevents two poller threads starting
