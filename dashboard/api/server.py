@@ -49,10 +49,14 @@ load_dotenv()
 # Print logs go to stdout so you can see them in the terminal where
 # you run `python api/server.py`. Level=DEBUG shows all model steps.
 logging.basicConfig(
-    level  = logging.DEBUG,
-    format = "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    datefmt= "%H:%M:%S",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
 )
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("google").setLevel(logging.WARNING)
+logging.getLogger("google.cloud").setLevel(logging.WARNING)
+logging.getLogger("google.auth").setLevel(logging.WARNING)
 log = logging.getLogger("server")
 
 app = Flask(
@@ -63,11 +67,11 @@ app = Flask(
 CORS(app)
 
 # ── Config ─────────────────────────────────────────────────────────
-PROJECT_ID  = os.getenv("GCP_PROJECT_ID",         "tensile-method-459009-k2")
-DATASET     = os.getenv("BIGQUERY_DATASET",        "spot_prices")
-TABLE       = os.getenv("BIGQUERY_TABLE",          "price_history")
+PROJECT_ID  = os.getenv("GCP_PROJECT_ID",         "")
+DATASET     = os.getenv("BIGQUERY_DATASET",        "")
+TABLE       = os.getenv("BIGQUERY_TABLE",          "")
 GCS_BUCKET  = os.getenv("CHECKPOINT_GCS_BUCKET",   "")
-GCP_ZONE    = os.getenv("GCP_ZONE",                "us-central1-a")
+GCP_ZONE    = os.getenv("GCP_ZONE",                "")
 
 POLLER_INTERVAL = 30
 MAX_MIGRATIONS  = 5
@@ -117,7 +121,7 @@ def gcs_list_job_states():
                         99, round((epoch / max(total_epochs, 1)) * 100)
                     )
                     states.append(state)
-                    print(state)
+                    #print(state)
                 except Exception:
                     pass
         return states
@@ -212,7 +216,7 @@ _poller.start()
 # RISK MODEL — load at startup with verbose print logs
 # ══════════════════════════════════════════════════════════════════
 
-from risk.predictor import load_models, score_instance
+from risk.predictor import load_models, score_instance_from_api
 
 def _load_risk_models_bg():
     """
@@ -473,32 +477,117 @@ def submit_job():
 
         synthetic_rows = {"synthetic-500k": 500_000, "synthetic-100k": 100_000}
         config = {
-            "job_id":           job_id,
-            "task_name":        data.get("task_name",    "Untitled"),
-            "lr":               float(data.get("lr",           0.001)),
-            "hidden_dim":       int(  data.get("hidden_dim",   256)),
-            "dropout":          float(data.get("dropout",      0.3)),
-            "batch_size":       int(  data.get("batch_size",   64)),
-            "epochs":           int(  data.get("epochs",       50)),
-            "ckpt_every":       int(  data.get("ckpt_every",   50)),
-            "input_dim":        int(  data.get("input_dim",    50)),
-            "num_classes":      int(  data.get("num_classes",  5)),
-            "max_budget":       float(data.get("max_budget",   2.0)),
-            "deadline_hrs":     float(data.get("deadline_hrs", 8.0)),
-            "cloud":            decision["cloud"],
-            "instance_type":    decision["instance_type"],
-            "region":           decision["region"],
-            "zone":             decision["zone"],
-            "price_usd_hr":     decision["price_usd_hr"],
-            "gcs_bucket":       GCS_BUCKET,
-            "dataset_type":       dataset_type,
-            "s3_dataset_path":    s3_dataset_path,
-            "dataset_name":       dataset_name or dataset_type,
-            "synthetic_rows":     synthetic_rows.get(dataset_type, 10_000),
-            "aws_access_key_id":     os.getenv("AWS_ACCESS_KEY_ID",     ""),
-            "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", ""),
-            "aws_default_region":    os.getenv("AWS_DEFAULT_REGION",    "us-east-1"),
-            "checkpoint_s3_bucket":  os.getenv("CHECKPOINT_S3_BUCKET",  ""),
+            # ─────────────────────────────────────────────
+            # Identity
+            # ─────────────────────────────────────────────
+            "job_id":            job_id,
+            "task_name":         data.get("task_name", "Untitled"),
+            "train_mode":        data.get("train_mode", "manual"),
+
+            # ─────────────────────────────────────────────
+            # Budget / scheduling
+            # ─────────────────────────────────────────────
+            "max_budget":        float(data.get("max_budget", 2.0)),
+            "deadline_hrs":      float(data.get("deadline_hrs", 8.0)),
+            "priority":          data.get("priority", "balanced"),
+
+            "spot_only":         bool(data.get("spot_only", True)),
+            "ondemand_max_hrs": float(data.get("ondemand_max_hrs", 1.0)),
+
+            # ─────────────────────────────────────────────
+            # Dataset
+            # ─────────────────────────────────────────────
+            "dataset_type":      dataset_type,
+            "dataset":           dataset_type,
+
+            "s3_dataset_path":   s3_dataset_path,
+            "dataset_name":      dataset_name or dataset_type,
+
+            "dataset_size":      int(data.get("dataset_size", 500000)),
+            "synthetic_rows":    synthetic_rows.get(dataset_type, 10000),
+
+            "input_dim":         int(data.get("input_dim", 50)),
+            "num_classes":       int(data.get("num_classes", 5)),
+
+            # ─────────────────────────────────────────────
+            # Model identity
+            # ─────────────────────────────────────────────
+            "model_arch":        data.get("model_arch", "mlp"),
+            "param_count":       data.get("param_count", "<1B"),
+            "training_paradigm": data.get("training_paradigm", "fine-tuning"),
+            "precision":         data.get("precision", "fp16"),
+
+            "min_gpu_mem":       int(data.get("min_gpu_mem", 0)),
+            "gpu_required":      bool(data.get("gpu_required", False)),
+
+            # ─────────────────────────────────────────────
+            # Manual training params
+            # ─────────────────────────────────────────────
+            "lr":                float(data.get("lr", 0.001)),
+            "hidden_dim":        int(data.get("hidden_dim", 256)),
+            "dropout":           float(data.get("dropout", 0.3)),
+            "batch_size":        int(data.get("batch_size", 64)),
+            "epochs":            int(data.get("epochs", 50)),
+            "ckpt_every":        int(data.get("ckpt_every", 50)),
+
+            # ─────────────────────────────────────────────
+            # Sweep mode params
+            # ─────────────────────────────────────────────
+            "sweep_lr_min":      float(data.get("sweep_lr_min", 0.0001)),
+            "sweep_lr_max":      float(data.get("sweep_lr_max", 0.01)),
+
+            "sweep_hidden":      data.get("sweep_hidden", [256]),
+
+            "sweep_trials":      int(data.get("sweep_trials", 5)),
+            "sweep_budget":      float(data.get("sweep_budget", 5.0)),
+
+            # ─────────────────────────────────────────────
+            # Compute preferences
+            # ─────────────────────────────────────────────
+            "preferred_clouds":  data.get(
+                "preferred_clouds",
+                ["aws", "gcp", "azure"]
+            ),
+
+            "preferred_regions": data.get("preferred_regions", ""),
+
+            "fallback":          data.get("fallback", "migrate"),
+
+            # ─────────────────────────────────────────────
+            # Carbon-aware scheduling
+            # ─────────────────────────────────────────────
+            "carbon_aware":      bool(data.get("carbon_aware", False)),
+            "carbon_weight":     data.get("carbon_weight", "balanced"),
+
+            # ─────────────────────────────────────────────
+            # Scheduler decision
+            # ─────────────────────────────────────────────
+            "cloud":             decision["cloud"],
+            "instance_type":     decision["instance_type"],
+            "region":            decision["region"],
+            "zone":              decision["zone"],
+            "price_usd_hr":      decision["price_usd_hr"],
+
+            # ─────────────────────────────────────────────
+            # Storage / checkpoints
+            # ─────────────────────────────────────────────
+            "gcs_bucket":        GCS_BUCKET,
+
+            "aws_access_key_id":
+                os.getenv("AWS_ACCESS_KEY_ID", ""),
+
+            "aws_secret_access_key":
+                os.getenv("AWS_SECRET_ACCESS_KEY", ""),
+
+            "aws_default_region":
+                os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+
+            "checkpoint_s3_bucket":
+                os.getenv("CHECKPOINT_S3_BUCKET", ""),
+
+            # ─────────────────────────────────────────────
+            # Migration / resume
+            # ─────────────────────────────────────────────
             "resume_from_step": 0,
             "migration_count":  0,
         }
@@ -580,97 +669,92 @@ def poller_status():
 
 @app.route("/api/risk")
 def risk_scores():
-    """
-    Returns preemption risk score 0–1 for each active instance.
-    Prints a detailed log for every instance scored so you can see
-    exactly what the model is doing in the server terminal.
-
-    Terminal output per request looks like:
-        ─────────────────────────────────────────
-        [risk] /api/risk called — 14:22:07
-        [risk] BQ query → 5 distinct instances
-        [risk] ── Scoring: aws / g4dn.xlarge / us-east-1 / us-east-1a
-        [risk]   BQ rows fetched : 10
-        [risk]   Feature cols    : ['price_usd_per_hr', 'hour_of_day', ...]
-        [risk]   Raw X shape     : (10, 12)
-        [risk]   Scaled X shape  : (10, 12)
-        [risk]   X_seq shape     : (1, 10, 12)
-        [risk]   X_flat shape    : (12,)
-        [risk]   LSTM out shape  : (8,)
-        [risk]   X_hybrid shape  : (1, 20)
-        [risk]   XGB proba       : [0.88  0.12]   ← [preempted, safe]
-        [risk]   RISK SCORE      : 0.1200
-        [risk] ── Scoring: gcp / g2-standard-4 / us-central1 / us-central1-a
-        ...
-        [risk] Results (sorted high→low risk):
-        [risk]   1. aws/p3.2xlarge    risk=0.8100  ← HIGH
-        [risk]   2. aws/g5.xlarge     risk=0.5400  ← MED
-        [risk]   3. azure/NC4as_T4_v3 risk=0.4700  ← MED
-        [risk]   4. gcp/g2-standard-4 risk=0.2300  ← LOW
-        [risk]   5. aws/g4dn.xlarge   risk=0.1200  ← LOW
-        ─────────────────────────────────────────
-    """
-    import numpy as np
-
     sep = "─" * 55
     ts  = datetime.now().strftime("%H:%M:%S")
     print(f"\n{sep}")
     print(f"[risk] /api/risk called — {ts}")
 
     try:
-        bq = get_bq_client()
+        # ── Step 1: Read running jobs from S3 ─────────────────────
+        # ── Step 1: Read running jobs from S3 ─────────────────────
+        import boto3, json as _json
+        s3         = boto3.client("s3")
+        bucket     = os.getenv("CHECKPOINT_BUCKET", "ml-scheduler-checkpoints")
+        paginator  = s3.get_paginator("list_objects_v2")
+        pages      = paginator.paginate(Bucket=bucket, Prefix="checkpoints/")
 
-        # ── Step 1: fetch distinct active instances ────────────────
-        query = f"""
-            SELECT DISTINCT cloud, region, availability_zone, instance_type
-            FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
-            WHERE collected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
-              AND preempted = FALSE
-            LIMIT 20
-        """
-        instances = list(bq.query(query))
-        print(f"[risk] BQ query → {len(instances)} distinct instance(s)")
+        # Statuses that mean the job is actively running on an instance
+        ACTIVE_STATUSES = {"running", "launched", "migrating"}
 
-        if not instances:
-            print(f"[risk] No instances found in last 1 hour — returning []")
+        running_jobs = []
+        for page in pages:
+            for obj in page.get("Contents", []):
+                if not obj["Key"].endswith("job_state.json"):
+                    continue
+                try:
+                    body  = s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read()
+                    state = _json.loads(body)
+                    if state.get("status") in ACTIVE_STATUSES:
+                        running_jobs.append(state)
+                except Exception as e:
+                    print(f"[risk]   Skipping {obj['Key']}: {e}")
+
+        print(f"[risk] Active jobs found: {len(running_jobs)}")
+
+        if not running_jobs:
+            print(f"[risk] No running jobs — returning []")
             print(sep + "\n")
             return jsonify([])
 
+        # ── Step 2: Score each running job ─────────────────────────
+        from risk.predictor import score_instance_from_api
         results = []
+        for job in running_jobs:
+            job_id   = job.get("job_id", "unknown")
+            
+            # Cloud/region/instance may be at top level OR inside launch_result
+            launch   = job.get("launch_result", {})
 
-        for row in instances:
-            cloud         = row["cloud"]
-            region        = row["region"]
-            az            = row["availability_zone"]
-            instance_type = row["instance_type"]
+            cloud         = job.get("cloud")         or launch.get("cloud",         "aws")
+            region        = launch.get("region")     or job.get("region",           "")
+            az            = launch.get("az")         or job.get("availability_zone", "") or job.get("zone", "")
+            instance_type = launch.get("instance_type") or job.get("instance",      "") or job.get("instance_type", "")
 
-            print(f"[risk] ── Scoring: {cloud} / {instance_type} / {region} / {az}")
+            print(f"[risk] ── Job {job_id}: {cloud}/{instance_type}/{region}/{az or 'no-az'}")
+
+            if not region or not instance_type:
+                print(f"[risk]   Skipping — missing region or instance_type")
+                continue
 
             try:
-                # ── Step 2: call score_instance with extra prints ──
-                risk = _score_with_logs(
-                    cloud=cloud, region=region, az=az,
-                    instance_type=instance_type, bq_client=bq,
+                # In your /api/risk route, you already have bq_client somewhere
+                # (or initialize it there). Pass it along:
+
+                risk = score_instance_from_api(
+                    cloud         = cloud,
+                    region        = region,
+                    az            = az,
+                    instance_type = instance_type,
+                    bq_client     = get_bq_client(),   # ← add this
                 )
+                level = "HIGH" if risk >= 0.6 else "MED" if risk >= 0.3 else "LOW"
+                print(f"[risk]   risk={risk:.4f}  ← {level}")
+
                 results.append({
+                    "job_id":        job_id,
                     "cloud":         cloud,
                     "instance_type": instance_type,
                     "region":        region,
                     "az":            az,
-                    "risk":          round(risk, 4),
+                    "risk":          risk,
+                    "level":         level,
+                    "task_name":     job.get("task_name", job_id),
                 })
-
             except Exception as e:
-                print(f"[risk]   ✗ FAILED: {type(e).__name__}: {e}")
+                print(f"[risk]   ✗ Score failed: {e}")
 
-        # ── Step 3: sort and print summary ────────────────────────
         results.sort(key=lambda x: x["risk"], reverse=True)
-        print(f"[risk] Results (sorted high→low risk):")
-        for i, r in enumerate(results, 1):
-            level = "HIGH" if r["risk"] >= 0.6 else "MED" if r["risk"] >= 0.3 else "LOW"
-            print(f"[risk]   {i}. {r['cloud']}/{r['instance_type']:<20} "
-                  f"risk={r['risk']:.4f}  ← {level}")
-
+        print(f"[risk] Scored {len(results)} running jobs")
         print(sep + "\n")
         return jsonify(results)
 
@@ -679,97 +763,19 @@ def risk_scores():
         print(sep + "\n")
         return jsonify({"error": str(e)}), 500
 
-
-"""
-Replace the existing _score_with_logs() function in api/server.py
-with this version. It uses the same fix as predictor.py:
-  - fetch only RAW columns from BQ
-  - run _engineer_features() to compute derived features
-  - then pass to LSTM + XGBoost
-
-Paste this function BEFORE the /api/risk route in server.py.
-"""
-
 def _score_with_logs(cloud, region, az, instance_type, bq_client) -> float:
     """
-    Verbose version of score_instance() used by /api/risk endpoint.
-    Prints every intermediate tensor shape so you can trace the full pipeline.
+    Verbose wrapper around score_instance().
+    All the detailed logging is now inside predictor.py itself.
     """
-    import torch
-    import numpy as np
-
-    from risk.predictor import (
-        load_models, _fetch_raw_rows, _engineer_features,
-        FEATURE_COLS, SEQUENCE_LEN,
-        _lstm, _xgb, _scaler, _feat_cols,
+    from risk.predictor import score_instance as _score
+    return _score(
+        cloud         = cloud,
+        region        = region,
+        az            = az,
+        instance_type = instance_type,
+        bq_client     = bq_client,
     )
-
-    load_models()  # no-op if already loaded
-
-    sep = "─" * 45
-
-    # ── Step 1: fetch RAW rows from BQ ───────────────────────────
-    # ONLY selects columns that exist in the table.
-    # spot_ratio, price_lag_*, hour etc are NOT in BQ — computed below.
-    print(f"[risk]   Fetching RAW rows from BQ...")
-    df_raw = _fetch_raw_rows(cloud, region, az, instance_type, bq_client)
-
-    if df_raw.empty or len(df_raw) < SEQUENCE_LEN:
-        n = len(df_raw) if not df_raw.empty else 0
-        print(f"[risk]   ⚠ Not enough rows ({n}/{SEQUENCE_LEN}) — returning 0.5")
-        return 0.5
-
-    print(f"[risk]   Raw rows       : {len(df_raw)}")
-    print(f"[risk]   Raw columns    : {list(df_raw.columns)}")
-
-    # ── Step 2: engineer features (mirrors 01_data_prep.py) ───────
-    print(f"[risk]   Engineering features...")
-    df_eng = _engineer_features(df_raw)
-
-    feat_cols = list(_feat_cols) if _feat_cols is not None else FEATURE_COLS
-    missing = [c for c in feat_cols if c not in df_eng.columns]
-    if missing:
-        print(f"[risk]   ✗ Missing after engineering: {missing} — returning 0.5")
-        return 0.5
-
-    print(f"[risk]   Feature cols   : {feat_cols}")
-    print(f"[risk]   Engineered rows: {len(df_eng)}")
-
-    # ── Step 3: build feature matrix ─────────────────────────────
-    X_raw = df_eng[feat_cols].values.astype(float)
-    print(f"[risk]   Raw X shape    : {X_raw.shape}")
-    print(f"[risk]   Raw X last row : {X_raw[-1].round(4).tolist()}")
-
-    # ── Step 4: scale ─────────────────────────────────────────────
-    X_scaled = _scaler.transform(X_raw)
-    print(f"[risk]   Scaled X shape : {X_scaled.shape}")
-    print(f"[risk]   Scaled last row: {X_scaled[-1].round(4).tolist()}")
-
-    X_seq  = X_scaled[-SEQUENCE_LEN:]   # (SEQUENCE_LEN, n_features)
-    X_flat = X_scaled[-1]               # (n_features,)
-    print(f"[risk]   X_seq shape    : {X_seq.shape}")
-    print(f"[risk]   X_flat shape   : {X_flat.shape}")
-
-    # ── Step 5: LSTM ──────────────────────────────────────────────
-    seq_tensor = torch.tensor(X_seq, dtype=torch.float32).unsqueeze(0)
-    print(f"[risk]   seq_tensor     : {tuple(seq_tensor.shape)}")
-
-    with torch.no_grad():
-        lstm_feats, lstm_logit = _lstm(seq_tensor)
-    lstm_feats = lstm_feats.squeeze(0).numpy()
-    print(f"[risk]   LSTM feats     : shape={lstm_feats.shape}  vals={lstm_feats.round(4).tolist()}")
-    print(f"[risk]   LSTM logit     : {lstm_logit.item():.4f}")
-
-    # ── Step 6: XGBoost ───────────────────────────────────────────
-    X_hybrid = np.hstack([lstm_feats, X_flat]).reshape(1, -1)
-    print(f"[risk]   X_hybrid shape : {X_hybrid.shape}  (LSTM_OUT + tabular)")
-
-    proba = _xgb.predict_proba(X_hybrid)[0]
-    risk  = float(proba[1])
-    print(f"[risk]   XGB proba      : {proba.round(4).tolist()}  [not_preempted, preempted]")
-    print(f"[risk]   RISK SCORE     : {risk:.4f}")
-
-    return round(risk, 4)
 
 
 # ══════════════════════════════════════════════════════════════════

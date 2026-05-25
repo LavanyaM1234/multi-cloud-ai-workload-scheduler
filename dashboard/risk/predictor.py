@@ -1,214 +1,97 @@
 """
 risk/predictor.py
 ──────────────────
-Loads trained model artifacts and scores preemption risk.
+Loads the trained LSTM + XGBoost hybrid model and scores
+preemption risk for any (cloud, region, az, instance_type).
 
-ROOT CAUSE FIX:
-  The old predictor tried to SELECT spot_ratio, price_lag_1, hour etc
-  directly from BigQuery → BadRequest because those are DERIVED features
-  computed in 01_data_prep.py, not stored columns.
+Model details (from hybrid_meta.json):
+  - Type:        LSTM + XGBoost Hybrid Regression
+  - Output:      continuous risk score 0.0 → 1.0
+  - Sequence:    last 60 timesteps per cloud/region/az
+  - Features:    29 (see feature_cols.pkl)
+  - Test R²:     0.992
+  - Test RMSE:   0.00123
 
-  Fix: fetch only RAW columns that exist in BigQuery, then run the same
-  feature engineering pipeline as 01_data_prep.py before passing to model.
-
-RAW columns fetched from BQ:
-  gpu_count, vcpu_count, ram_gb,
-  price_usd_per_hr, ondemand_price_usd_hr,
-  preempted, collected_at,
-  cloud, region, availability_zone, instance_type, gpu_class
-
-Derived features computed here (matching 01_data_prep.py exactly):
-  spot_ratio, price_lag_1/5/10, price_change, price_pct_chg,
-  price_rolling_mean_5/10, price_rolling_std_5,
-  recent_preempt_rate, hour, day_of_week, is_weekend,
-  cloud_enc, region_enc, availability_zone_enc,
-  instance_type_enc, gpu_class_enc
+LSTM architecture (must match train_hybrid_model.py):
+  LSTMFeatureExtractor(input_size=29, hidden=64, layers=2, out_dim=8)
+  with attention mechanism + compress head
 """
 
 import os
 import json
 import logging
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# ── Singleton cache ───────────────────────────────────────────────
+# ── Singleton cache ────────────────────────────────────────────────
 _lstm      = None
 _xgb       = None
 _scaler    = None
-_encoders  = None   # dict of {col: LabelEncoder} from 01_data_prep.py
 _feat_cols = None
+_encoders  = None
 _meta      = None
 
-_HERE        = Path(__file__).parent   # dashboard/risk/
-PROJECT_ROOT = _HERE.parent            # dashboard/
-MODELS_DIR     = PROJECT_ROOT / "model"
+_HERE        = Path(__file__).parent
+PROJECT_ROOT = _HERE.parent
+MODELS_DIR     = PROJECT_ROOT / "models"
 MODEL_DATA_DIR = PROJECT_ROOT / "model_data"
 
-SEQUENCE_LEN = 10  # must match 02_train_hybrid_model.py
-
-# ── Raw columns to fetch from BigQuery ────────────────────────────
-# ONLY columns that actually exist in the price_history table.
-# All other features are derived below in _engineer_features().
-RAW_BQ_COLS = [
-    "gpu_count", "vcpu_count", "ram_gb",
-    "price_usd_per_hr", "ondemand_price_usd_hr",
-    "preempted", "collected_at",
-    "cloud", "region", "availability_zone",
-    "instance_type", "gpu_class",
-]
-
-# ── Feature columns — must match FEATURE_COLS in 01_data_prep.py ──
-FEATURE_COLS = [
-    "gpu_count", "vcpu_count", "ram_gb",
-    "price_usd_per_hr", "ondemand_price_usd_hr",
-    "spot_ratio",
-    "price_lag_1", "price_lag_5", "price_lag_10",
-    "price_change", "price_pct_chg",
-    "price_rolling_mean_5", "price_rolling_mean_10", "price_rolling_std_5",
-    "recent_preempt_rate",
-    "hour", "day_of_week", "is_weekend",
-    "cloud_enc", "region_enc", "availability_zone_enc",
-    "instance_type_enc", "gpu_class_enc",
-]
+SEQUENCE_LEN = 60    # from hybrid_meta.json
+LSTM_OUT_DIM = 8     # from hybrid_meta.json
 
 
 # ══════════════════════════════════════════════════════════════════
-# FEATURE ENGINEERING — mirrors 01_data_prep.py exactly
+# LSTM ARCHITECTURE — must match train_hybrid_model.py exactly
 # ══════════════════════════════════════════════════════════════════
 
-def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Takes a DataFrame with RAW_BQ_COLS and returns one with FEATURE_COLS.
-    Must mirror 01_data_prep.py engineer_features() exactly so the
-    scaler and model see the same distribution at inference time.
+def _build_lstm(n_features: int):
+    import torch.nn as nn
 
-    df must be sorted by collected_at ascending before calling this.
-    """
-
-    df = df.copy()
-    print(f"[debug] after copy: {df.shape}")
-    df["collected_at"] = pd.to_datetime(df["collected_at"], utc=True)
-    print(f"[debug] after to_datetime: {df.shape}")
-    df = df.sort_values(["cloud", "region", "availability_zone", "collected_at"])
-    print(f"[debug] after sort_values: {df.shape}")
-    df = df.reset_index(drop=True)
-    print(f"[debug] after reset_index: {df.shape}")
-
-
-    grp = df.groupby(["cloud", "region", "availability_zone"])
-    print(f"[debug] after groupby: {df.shape}")
-
-    # Price lag features
-
-    df["price_lag_1"]  = grp["price_usd_per_hr"].shift(1)
-    df["price_lag_3"]  = grp["price_usd_per_hr"].shift(3)
-    df["price_lag_5"]  = grp["price_usd_per_hr"].shift(5)
-    df["price_lag_10"] = grp["price_usd_per_hr"].shift(10)
-    print(f"[debug] after lag features: {df.shape}")
-
-    # Price change
-
-    df["price_change_1"]  = df["price_usd_per_hr"] - df["price_lag_1"]
-    df["price_pct_chg_1"] = df["price_change_1"] / df["price_lag_1"].replace(0, 1e-6)
-    print(f"[debug] after price change: {df.shape}")
-
-    # Rolling stats
-
-    df["price_roll_mean_5"]  = grp["price_usd_per_hr"].transform(lambda x: x.rolling(5,  min_periods=1).mean())
-    df["price_roll_mean_10"] = grp["price_usd_per_hr"].transform(lambda x: x.rolling(10, min_periods=1).mean())
-    df["price_roll_std_5"]   = grp["price_usd_per_hr"].transform(lambda x: x.rolling(5,  min_periods=1).std().fillna(0))
-    df["price_roll_max_5"]   = grp["price_usd_per_hr"].transform(lambda x: x.rolling(5,  min_periods=1).max())
-    print(f"[debug] after rolling stats: {df.shape}")
-
-    # Price ratios
-
-    df["spot_ratio"]    = df["price_usd_per_hr"] / df["ondemand_price_usd_hr"].replace(0, 1e-6)
-    df["price_vs_mean"] = df["price_usd_per_hr"] / df["price_roll_mean_5"].replace(0, 1e-6)
-    print(f"[debug] after price ratios: {df.shape}")
-
-    # Preemption history
-
-    df["recent_preempt_rate_5"]  = grp["preempted"].transform(lambda x: x.rolling(5,  min_periods=1).mean())
-    df["recent_preempt_rate_10"] = grp["preempted"].transform(lambda x: x.rolling(10, min_periods=1).mean())
-    print(f"[debug] after preempt rates: {df.shape}")
-
-    # Preemption streak — how many consecutive preemptions
-    def calc_streak(series):
-        streak = np.zeros(len(series), dtype=int)
-        count  = 0
-        for i, v in enumerate(series):
-            count     = count + 1 if v else 0
-            streak[i] = count
-        return streak
-
-
-    df["preempt_streak"] = grp["preempted"].transform(
-        lambda x: pd.Series(calc_streak(x.values), index=x.index)
-    )
-    print(f"[debug] after preempt streak: {df.shape}")
-
-    # Time features
-
-    df["hour"]               = df["collected_at"].dt.hour
-    df["day_of_week"]        = df["collected_at"].dt.dayofweek
-    df["is_weekend"]         = df["day_of_week"].isin([5, 6]).astype(int)
-    df["is_business_hours"]  = df["hour"].between(9, 17).astype(int)
-    print(f"[debug] after time features: {df.shape}")
-
-    # Cloud+region identity (for routing)
-
-    df["cloud_region_zone"] = df["cloud"] + "|" + df["region"] + "|" + df["availability_zone"]
-    print(f"[debug] after cloud_region_zone: {df.shape}")
-
-    # Encode categoricals
-
-    cat_map = {
-        "cloud":             "cloud_enc",
-        "region":            "region_enc",
-        "availability_zone": "zone_enc",
-        "instance_type":     "instance_type_enc",
-        "gpu_class":         "gpu_class_enc",
-    }
-    for col, enc_col in cat_map.items():
-        if _encoders and col in _encoders:
-            le = _encoders[col]
-            known = set(le.classes_)
-            df[enc_col] = df[col].astype(str).apply(
-                lambda v: le.transform([v])[0] if v in known else 0
+    class LSTMFeatureExtractor(nn.Module):
+        def __init__(self, input_size, hidden=64, layers=2, out_dim=LSTM_OUT_DIM):
+            super().__init__()
+            self.lstm = nn.LSTM(
+                input_size=input_size, hidden_size=hidden,
+                num_layers=layers, dropout=0.3, batch_first=True
             )
-        else:
-            df[enc_col] = df[col].astype("category").cat.codes
-    print(f"[debug] after encoding categoricals: {df.shape}")
+            self.attn = nn.Sequential(
+                nn.Linear(hidden, 32), nn.Tanh(), nn.Linear(32, 1)
+            )
+            self.compress = nn.Sequential(
+                nn.Linear(hidden, 32), nn.ReLU(), nn.Dropout(0.2),
+                nn.Linear(32, out_dim), nn.Tanh(),
+            )
+            self.head = nn.Sequential(
+                nn.Linear(out_dim, 1)
+            )
 
+        def forward(self, x):
+            out, _   = self.lstm(x)
+            attn_w   = __import__('torch').softmax(self.attn(out), dim=1)
+            ctx      = (attn_w * out).sum(dim=1)
+            features = self.compress(ctx)
+            logits   = self.head(features).squeeze(-1)
+            return features, logits
 
-    # Drop rows with NaN from lag features
-    print(f"[debug] before dropna price_lag_1: {df.shape}")
-    df = df.dropna(subset=["price_lag_1"]).reset_index(drop=True)
-    print(f"[debug] after dropna price_lag_1: {df.shape}")
-
-
-    # Fill remaining NaN/Inf
-    print(f"[debug] before fillna: {df.shape}")
-    df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
-    print(f"[debug] after fillna: {df.shape}")
-
-    return df
+    return LSTMFeatureExtractor(input_size=n_features)
 
 
 # ══════════════════════════════════════════════════════════════════
-# MODEL LOADING
+# LOAD
 # ══════════════════════════════════════════════════════════════════
 
-def _check_model_files():
+def _check_files():
     required = [
         MODELS_DIR     / "lstm_extractor.pt",
         MODELS_DIR     / "xgb_hybrid.pkl",
         MODELS_DIR     / "hybrid_meta.json",
         MODEL_DATA_DIR / "scaler.pkl",
         MODEL_DATA_DIR / "feature_cols.pkl",
+        MODEL_DATA_DIR / "encoders.pkl",
     ]
     print("[risk] Checking model files:")
     missing = []
@@ -220,68 +103,45 @@ def _check_model_files():
             missing.append(str(p))
     if missing:
         raise FileNotFoundError(
-            "[risk] Missing model files:\n" + "\n".join(f"  {m}" for m in missing)
+            "[risk] Missing files:\n" + "\n".join(missing)
         )
 
 
 def load_models():
-    """Load all model artifacts into memory. Safe to call multiple times."""
-    global _lstm, _xgb, _scaler, _encoders, _feat_cols, _meta
+    """Load all artifacts. Safe to call multiple times."""
+    global _lstm, _xgb, _scaler, _feat_cols, _encoders, _meta
 
     if _lstm is not None:
-        print("[risk] load_models() — already loaded, skipping")
         return
 
-    _check_model_files()
+    _check_files()
 
     import torch
     import joblib
-    from risk.lstm_arch import LSTMFeatureExtractor
 
-    # ── Metadata ──────────────────────────────────────────────────
-    print("\n[risk] Loading hybrid_meta.json ...")
+    # Meta
     with open(MODELS_DIR / "hybrid_meta.json") as f:
         _meta = json.load(f)
-    print(f"[risk]   n_features   : {_meta['n_features']}")
-    print(f"[risk]   test_roc_auc : {_meta.get('test_roc_auc', 'n/a')}")
+    print(f"[risk] Model: {_meta['model_type']}")
+    print(f"[risk]   n_features={_meta['n_features']}  "
+          f"seq_len={_meta['sequence_len']}  "
+          f"R²={_meta['test_r2']:.4f}")
 
-    # ── Feature columns ───────────────────────────────────────────
-    print("\n[risk] Loading feature_cols.pkl ...")
+    # Feature cols + scaler + encoders
     _feat_cols = joblib.load(MODEL_DATA_DIR / "feature_cols.pkl")
-    print(f"[risk]   {len(_feat_cols)} feature cols: {list(_feat_cols)}")
+    _scaler    = joblib.load(MODEL_DATA_DIR / "scaler.pkl")
+    _encoders  = joblib.load(MODEL_DATA_DIR / "encoders.pkl")
+    print(f"[risk]   {len(_feat_cols)} features: {list(_feat_cols)}")
+    print(f"[risk]   Encoded cols: {list(_encoders.keys())}")
 
-    # Verify matches hardcoded FEATURE_COLS
-    if list(_feat_cols) != FEATURE_COLS:
-        print(f"[risk]   ⚠ WARNING: feature_cols.pkl differs from FEATURE_COLS")
-        print(f"[risk]   pkl:  {list(_feat_cols)}")
-        print(f"[risk]   code: {FEATURE_COLS}")
-
-    # ── Scaler ────────────────────────────────────────────────────
-    print("\n[risk] Loading scaler.pkl ...")
-    _scaler = joblib.load(MODEL_DATA_DIR / "scaler.pkl")
-    print(f"[risk]   type: {type(_scaler).__name__}")
-
-    # ── Encoders (from 01_data_prep.py) ───────────────────────────
-    encoders_path = MODEL_DATA_DIR / "encoders.pkl"
-    if encoders_path.exists():
-        print("\n[risk] Loading encoders.pkl ...")
-        _encoders = joblib.load(encoders_path)
-        print(f"[risk]   encoder keys: {list(_encoders.keys())}")
-    else:
-        print("\n[risk] ⚠ encoders.pkl not found — using fallback hash encoding")
-        _encoders = {}
-
-    # ── XGBoost ───────────────────────────────────────────────────
-    print("\n[risk] Loading xgb_hybrid.pkl ...")
+    # XGBoost — regression model, use .predict() not .predict_proba()
     _xgb = joblib.load(MODELS_DIR / "xgb_hybrid.pkl")
-    print(f"[risk]   type             : {type(_xgb).__name__}")
-    print(f"[risk]   n_estimators     : {getattr(_xgb, 'n_estimators', '?')}")
-    print(f"[risk]   n_features_in_   : {getattr(_xgb, 'n_features_in_', '?')}")
+    print(f"[risk]   XGBoost: {type(_xgb).__name__}  "
+          f"n_estimators={getattr(_xgb, 'n_estimators', '?')}")
 
-    # ── LSTM ──────────────────────────────────────────────────────
-    print("\n[risk] Loading lstm_extractor.pt ...")
+    # LSTM
     n_features = _meta["n_features"]
-    lstm_model = LSTMFeatureExtractor(input_size=n_features)
+    lstm_model = _build_lstm(n_features)
     state = torch.load(
         MODELS_DIR / "lstm_extractor.pt",
         map_location="cpu",
@@ -294,195 +154,512 @@ def load_models():
     # Smoke test
     dummy = torch.zeros(1, SEQUENCE_LEN, n_features)
     with torch.no_grad():
-        feats, logit = _lstm(dummy)
-    print(f"[risk]   smoke test: feats={tuple(feats.shape)} logit={logit.item():.4f}")
-    print(f"\n[risk] ✓ All models loaded\n")
+        feats, logit = lstm_model(dummy)
+    print(f"[risk]   LSTM smoke test: feats={tuple(feats.shape)}  "
+          f"logit={logit.item():.4f}")
+    print(f"[risk] All models loaded\n")
 
 
 # ══════════════════════════════════════════════════════════════════
-# BQ DATA FETCH — raw columns only
+# FEATURE ENGINEERING — mirrors prepare_data.py exactly
 # ══════════════════════════════════════════════════════════════════
 
-def _fetch_raw_rows(cloud, region, az, instance_type, bq_client) -> pd.DataFrame:
+def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fetch RAW rows from BigQuery for one instance.
-    Only selects columns that actually exist in the table.
-    Returns DataFrame with at least SEQUENCE_LEN rows, or empty.
+    Reproduce every feature from prepare_data.py FEATURE_COLS.
+    Column names must match exactly — including zone_enc not availability_zone_enc.
     """
-    PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "tensile-method-459009-k2")
+    df  = df.copy()
+    eps = 1e-9
+
+    # ── Timestamp ──────────────────────────────────────────────────
+    df["collected_at"] = pd.to_datetime(df["collected_at"], utc=True)
+    df["hour"]              = df["collected_at"].dt.hour
+    df["day_of_week"]       = df["collected_at"].dt.dayofweek
+    df["is_weekend"]        = df["day_of_week"].isin([5, 6]).astype(int)
+    df["is_business_hours"] = df["hour"].between(9, 17).astype(int)
+
+    # ── Price ratios ───────────────────────────────────────────────
+    df["spot_ratio"]   = df["price_usd_per_hr"] / df["ondemand_price_usd_hr"].replace(0, eps)
+    mean_price = df["price_usd_per_hr"].mean()
+    if mean_price == 0:
+            mean_price = eps
+
+    df["price_vs_mean"] = df["price_usd_per_hr"] / mean_price
+
+    # ── Sort (prepare_data groups by cloud/region/az) ──────────────
+    df = df.sort_values("collected_at").reset_index(drop=True)
+
+    # ── Lag features ───────────────────────────────────────────────
+    df["price_lag_1"]  = df["price_usd_per_hr"].shift(1)
+    df["price_lag_3"]  = df["price_usd_per_hr"].shift(3)
+    df["price_lag_5"]  = df["price_usd_per_hr"].shift(5)
+    df["price_lag_10"] = df["price_usd_per_hr"].shift(10)
+
+    # ── Price changes ──────────────────────────────────────────────
+    df["price_change_1"]  = df["price_usd_per_hr"] - df["price_lag_1"]
+    df["price_pct_chg_1"] = df["price_change_1"] / df["price_lag_1"].replace(0, eps)
+
+    # ── Rolling stats ──────────────────────────────────────────────
+    df["price_roll_mean_5"]  = df["price_usd_per_hr"].rolling(5,  min_periods=1).mean()
+    df["price_roll_mean_10"] = df["price_usd_per_hr"].rolling(10, min_periods=1).mean()
+    df["price_roll_std_5"]   = df["price_usd_per_hr"].rolling(5,  min_periods=1).std().fillna(0)
+    df["price_roll_max_5"]   = df["price_usd_per_hr"].rolling(5,  min_periods=1).max()
+
+    # ── Preemption rate features ───────────────────────────────────
+    if "preempted" in df.columns:
+        p = df["preempted"].astype(float)
+        df["recent_preempt_rate_5"]  = p.rolling(5,  min_periods=1).mean()
+        df["recent_preempt_rate_10"] = p.rolling(10, min_periods=1).mean()
+        # Consecutive preemption streak
+        df["preempt_streak"] = p.groupby(
+            (p != p.shift()).cumsum()
+        ).cumcount().where(p == 1, 0)
+    else:
+        df["recent_preempt_rate_5"]  = 0.0
+        df["recent_preempt_rate_10"] = 0.0
+        df["preempt_streak"]         = 0
+
+    # ── Categorical encoding ───────────────────────────────────────
+    # Note: prepare_data.py uses "zone_enc" for availability_zone
+    cat_map = {
+        "cloud":             "cloud_enc",
+        "region":            "region_enc",
+        "availability_zone": "zone_enc",        # ← zone_enc not availability_zone_enc
+        "instance_type":     "instance_type_enc",
+        "gpu_class":         "gpu_class_enc",
+    }
+    for col, enc_col in cat_map.items():
+        if col in df.columns and col in _encoders:
+            le    = _encoders[col]
+            known = set(le.classes_)
+            df[enc_col] = df[col].astype(str).apply(
+                lambda x: int(le.transform([x])[0]) if x in known else 0
+            )
+        else:
+            df[enc_col] = 0
+
+    # ── Fill NaN ───────────────────────────────────────────────────
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.fillna(0)
+
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════
+# FETCH + SCORE
+# ══════════════════════════════════════════════════════════════════
+
+def _fetch_rows(cloud, region, az, instance_type, bq_client) -> pd.DataFrame:
+    """Fetch raw rows from BigQuery — only columns that exist in the table."""
+    from google.cloud.bigquery import QueryJobConfig, ScalarQueryParameter
+
+    PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "")
     DATASET    = os.getenv("BIGQUERY_DATASET", "spot_prices")
     TABLE      = os.getenv("BIGQUERY_TABLE",   "price_history")
 
-    from google.cloud.bigquery import QueryJobConfig, ScalarQueryParameter
-
-    # Fetch SEQUENCE_LEN + 10 extra rows so lag/rolling features
-    # can be computed for the last SEQUENCE_LEN rows without NaN issues
-    n_fetch = SEQUENCE_LEN + 15
-
-    # Build SELECT only from columns that exist in BQ
-    select_cols = ", ".join(RAW_BQ_COLS)
-
-    # az can be None for GCP (no availability_zone in their table)
-    if az and az != "None":
-        az_filter = "AND availability_zone = @az"
-        az_param  = [ScalarQueryParameter("az", "STRING", az)]
-    else:
-        az_filter = ""
-        az_param  = []
+    RAW_COLS = [
+        "price_usd_per_hr", "ondemand_price_usd_hr",
+        "gpu_count", "vcpu_count", "ram_gb",
+        "cloud", "region", "availability_zone",
+        "instance_type", "gpu_class",
+        "preempted", "collected_at",
+    ]
 
     query = f"""
-        SELECT {select_cols}
+        SELECT {', '.join(RAW_COLS)}
         FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
-        WHERE cloud         = @cloud
-          AND region        = @region
-          AND instance_type = @instance_type
-          AND preempted     = FALSE
-          {az_filter}
+        WHERE cloud             = @cloud
+          AND region            = @region
+          AND availability_zone = @az
+          AND instance_type     = @instance_type
         ORDER BY collected_at DESC
-        LIMIT {n_fetch}
+        LIMIT {SEQUENCE_LEN + 15}
     """
-
-    params = [
+    cfg  = QueryJobConfig(query_parameters=[
         ScalarQueryParameter("cloud",         "STRING", cloud),
         ScalarQueryParameter("region",        "STRING", region),
+        ScalarQueryParameter("az",            "STRING", az),
         ScalarQueryParameter("instance_type", "STRING", instance_type),
-    ] + az_param
-
-    job_config = QueryJobConfig(query_parameters=params)
-    rows = list(bq_client.query(query, job_config=job_config))
-    print(f"[risk]   BQ raw rows fetched: {len(rows)}  (need {SEQUENCE_LEN})")
-
-    if not rows:
-        return pd.DataFrame()
-
+    ])
+    rows = list(bq_client.query(query, job_config=cfg))
     return pd.DataFrame([dict(r) for r in rows])
 
 
-# ══════════════════════════════════════════════════════════════════
-# SCORE ONE INSTANCE
-# ══════════════════════════════════════════════════════════════════
-
-def score_instance(
-    cloud:         str,
-    region:        str,
-    az:            str,
-    instance_type: str,
-    bq_client,
-) -> float:
+def score_instance(cloud, region, az, instance_type, bq_client) -> float:
     """
     Score preemption risk for one instance.
-    Returns float 0.0–1.0.
-    Returns 0.5 (neutral) if not enough data.
-
-    Pipeline:
-      1. Fetch RAW rows from BQ (only existing columns)
-      2. Run _engineer_features() to compute derived features
-      3. Scale with saved scaler
-      4. Pass last SEQUENCE_LEN rows through LSTM → feature vector
-      5. Combine LSTM features + last tabular row → XGBoost input
-      6. Return XGBoost preemption probability
+    Returns float 0.0–1.0. Returns 0.5 if not enough data.
     """
     import torch
 
-    load_models()  # no-op if already loaded
+    load_models()
 
-    # ── Step 1: fetch raw data ────────────────────────────────────
-    df_raw = _fetch_raw_rows(cloud, region, az, instance_type, bq_client)
-    if df_raw.empty or len(df_raw) < SEQUENCE_LEN:
-        print(f"[risk]   ⚠ Not enough rows ({len(df_raw)}/{SEQUENCE_LEN}) — returning 0.5")
+    print(f"[risk] Scoring: {cloud}/{instance_type}/{region}/{az}")
+
+    df_raw = _fetch_rows(cloud, region, az, instance_type, bq_client)
+    print(f"[risk]   BQ rows: {len(df_raw)}  (need {SEQUENCE_LEN})")
+
+    if len(df_raw) < SEQUENCE_LEN:
+        print(f"[risk]   Not enough rows → returning 0.5")
         return 0.5
 
-    # ── Step 2: engineer features (same as 01_data_prep.py) ───────
-    df_eng = _engineer_features(df_raw)
+    # Feature engineering
+    df = _engineer_features(df_raw)
 
-    # Use the saved feature_cols order (from pkl file) not hardcoded
-    feat_cols = list(_feat_cols) if _feat_cols is not None else FEATURE_COLS
+    # Validate all features present
+    missing = [c for c in _feat_cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"[risk] Missing features: {missing}\n"
+            f"Add to _engineer_features() to match prepare_data.py"
+        )
 
-    # Verify all feature cols are present after engineering
-    missing_cols = [c for c in feat_cols if c not in df_eng.columns]
-    if missing_cols:
-        print(f"[risk]   ✗ Missing engineered cols: {missing_cols} — returning 0.5")
-        return 0.5
+    # Build arrays
+    X_raw  = df[list(_feat_cols)].values.astype(np.float32)
+    X_sc   = _scaler.transform(X_raw)
+    X_seq  = X_sc[-SEQUENCE_LEN:]   # (60, 29) — sequence for LSTM
+    X_flat = X_sc[-1]               # (29,)    — latest row for XGBoost
 
-    # ── Step 3: extract feature matrix ───────────────────────────
-    X_raw = df_eng[feat_cols].values.astype(np.float32)
-    # Take the last n_fetch rows after engineering (lags may shrink available rows)
-    # Ensure we have enough for the sequence
-    if len(X_raw) < SEQUENCE_LEN:
-        print(f"[risk]   ⚠ After engineering only {len(X_raw)} rows — returning 0.5")
-        return 0.5
+    print(f"[risk]   X_seq: {X_seq.shape}  price_last={df['price_usd_per_hr'].iloc[-1]:.4f}")
+    print(f"[risk]   spot_ratio={df['spot_ratio'].iloc[-1]:.4f}  "
+          f"preempt_rate_5={df['recent_preempt_rate_5'].iloc[-1]:.4f}")
 
-    # ── Step 4: scale ─────────────────────────────────────────────
-    X_scaled = _scaler.transform(X_raw)
-
-    # Take the last SEQUENCE_LEN rows for the LSTM window
-    X_seq  = X_scaled[-SEQUENCE_LEN:]   # shape: (SEQUENCE_LEN, n_features)
-    X_flat = X_scaled[-1]               # shape: (n_features,) — last row for XGB tabular
-
-    print(f"[risk]   X_seq shape : {X_seq.shape}")
-    print(f"[risk]   X_flat shape: {X_flat.shape}")
-    print(f"[risk]   X_seq[-1] sample (first 4): {X_seq[-1][:4].round(4).tolist()}")
-
-    # ── Step 5: LSTM forward pass ──────────────────────────────────
-    seq_tensor = torch.tensor(X_seq).unsqueeze(0)   # (1, seq_len, n_features)
+    # LSTM → temporal features
+    seq_t = torch.tensor(X_seq).unsqueeze(0)   # (1, 60, 29)
     with torch.no_grad():
-        lstm_feats, lstm_logit = _lstm(seq_tensor)
-    lstm_feats = lstm_feats.squeeze(0).numpy()       # (lstm_out_dim,)
-    print(f"[risk]   LSTM feats shape: {lstm_feats.shape}  logit: {lstm_logit.item():.4f}")
+        lstm_feats, lstm_logit = _lstm(seq_t)
+    lstm_feats = lstm_feats.squeeze(0).numpy()  # (8,)
+    print(f"[risk]   LSTM logit={lstm_logit.item():.4f}  "
+          f"feats={lstm_feats.round(3).tolist()}")
 
-    # ── Step 6: XGBoost hybrid forward pass ───────────────────────
-    X_hybrid = np.hstack([lstm_feats, X_flat]).reshape(1, -1)
-    print(f"[risk]   X_hybrid shape: {X_hybrid.shape}")
-
-    proba = _xgb.predict_proba(X_hybrid)[0]
-    risk  = float(proba[1])   # class 1 = preempted
-    print(f"[risk]   XGB proba: {proba.round(4).tolist()}  → risk={risk:.4f}")
+    # XGBoost regression → risk score directly (no predict_proba)
+    X_hybrid = np.hstack([lstm_feats, X_flat]).reshape(1, -1)  # (1, 37)
+    risk     = float(_xgb.predict(X_hybrid)[0])
+    risk     = float(np.clip(risk, 0.0, 1.0))   # safety clip
+    print(f"[risk]   RISK SCORE = {risk:.4f}")
 
     return round(risk, 4)
 
 
-# ══════════════════════════════════════════════════════════════════
-# SCORE ALL ACTIVE INSTANCES — called by /api/risk
-# ══════════════════════════════════════════════════════════════════
-
-def score_all_instances(bq_client) -> list:
-    """
-    Score every distinct active instance.
-    Returns list of dicts sorted by risk descending.
-    """
-    PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "tensile-method-459009-k2")
+def score_all_instances(bq_client) -> list[dict]:
+    """Score every distinct active instance. Returns list sorted by risk desc."""
+    
+    PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "")
     DATASET    = os.getenv("BIGQUERY_DATASET", "spot_prices")
     TABLE      = os.getenv("BIGQUERY_TABLE",   "price_history")
 
     query = f"""
         SELECT DISTINCT cloud, region, availability_zone, instance_type
         FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
-        WHERE preempted    = FALSE
-          AND gpu_class   != 'none'
+        WHERE preempted = FALSE
           AND collected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 HOUR)
         ORDER BY cloud, instance_type
     """
+
+    print("\n[risk] Running instance discovery query...")
     instances = list(bq_client.query(query))
-    results   = []
 
-    for row in instances:
+    print(f"[risk] Found {len(instances)} instances")
+
+    for i, row in enumerate(instances, 1):
+        print(f"[risk] Instance {i}: {dict(row)}")
+
+    results = []
+
+    for i, row in enumerate(instances, 1):
         try:
-            score = score_instance(
-                cloud         = row["cloud"],
-                region        = row["region"],
-                az            = row["availability_zone"],
-                instance_type = row["instance_type"],
-                bq_client     = bq_client,
-            )
-            results.append({
-                "cloud":         row["cloud"],
-                "region":        row["region"],
-                "az":            row["availability_zone"],
-                "instance_type": row["instance_type"],
-                "risk":          score,
-            })
-        except Exception as e:
-            log.warning(f"[risk] Skipping {row['instance_type']}: {e}")
+            print("\n" + "="*60)
+            print(f"[risk] START SCORING #{i}")
+            print(f"[risk] cloud         = {row['cloud']}")
+            print(f"[risk] region        = {row['region']}")
+            print(f"[risk] az            = {row['availability_zone']}")
+            print(f"[risk] instance_type = {row['instance_type']}")
 
-    results.sort(key=lambda x: x["risk"], reverse=True)
+            score = score_instance(
+                cloud=row["cloud"],
+                region=row["region"],
+                az=row["availability_zone"],
+                instance_type=row["instance_type"],
+                bq_client=bq_client,
+            )
+
+            print(f"[risk] FINAL SCORE = {score}")
+
+            results.append({
+                "cloud": row["cloud"],
+                "region": row["region"],
+                "az": row["availability_zone"],
+                "instance_type": row["instance_type"],
+                "risk_score": score,
+            })
+
+        except Exception as e:
+            print(f"[risk] ERROR: {type(e).__name__}: {e}")
+
+    results.sort(key=lambda x: x["risk_score"], reverse=True)
+
+    print("\n[risk] FINAL SORTED RESULTS")
+    for r in results:
+        print(r)
+
     return results
+
+
+
+
+def _fetch_live_prices(cloud: str, region: str, az: str,
+                        instance_type: str) -> pd.DataFrame:
+    """
+    Fetch live spot price history from cloud APIs.
+    Returns a DataFrame with the same columns as BigQuery would.
+    """
+    rows = []
+
+    if cloud == "aws":
+        import boto3
+        from datetime import datetime, timezone, timedelta
+
+        ec2 = boto3.client("ec2", region_name=region)
+
+        if not az:
+            zones_resp = ec2.describe_availability_zones(
+                Filters=[{"Name": "region-name", "Values": [region]}]
+            )
+
+            zones = [
+                z["ZoneName"]
+                for z in zones_resp["AvailabilityZones"]
+                if z["State"] == "available"
+            ]
+
+            az = zones[0] if zones else None
+            print(f"[risk]   Auto-selected AZ: {az}")
+
+        params = {
+            "InstanceTypes": [instance_type],
+            "ProductDescriptions": ["Linux/UNIX"],
+            "StartTime": datetime.now(timezone.utc) - timedelta(hours=72),
+            "MaxResults": 100,
+        }
+
+        if az:
+            params["AvailabilityZone"] = az
+
+        resp = ec2.describe_spot_price_history(**params)
+
+        print(f"[risk]   Retrieved {len(resp.get('SpotPriceHistory', []))} spot records")
+
+        for entry in resp.get("SpotPriceHistory", []):
+            rows.append({
+                "price_usd_per_hr":      float(entry["SpotPrice"]),
+                "ondemand_price_usd_hr": _get_aws_ondemand(instance_type),
+                "gpu_count":             0,
+                "vcpu_count":            0,
+                "ram_gb":                0.0,
+                "cloud":                 "aws",
+                "region":                region,
+                "availability_zone":     entry.get("AvailabilityZone", az),
+                "instance_type":         instance_type,
+                "gpu_class":             "none",
+                "preempted":             False,
+                "collected_at":          entry["Timestamp"],
+            })
+
+
+    elif cloud == "gcp":
+        # GCP preemptible prices are quasi-static — generate synthetic history
+        # from the known price with small noise to fill the sequence
+        import random
+        base_price = _get_gcp_preemptible_price(instance_type, region)
+        now        = pd.Timestamp.now(tz="UTC")
+        for i in range(SEQUENCE_LEN + 10):
+            noise = random.uniform(-0.002, 0.002)
+            rows.append({
+                "price_usd_per_hr":      round(base_price + noise, 4),
+                "ondemand_price_usd_hr": base_price * 4,
+                "gpu_count":             0,
+                "vcpu_count":            0,
+                "ram_gb":                0.0,
+                "cloud":                 "gcp",
+                "region":                region,
+                "availability_zone":     az,
+                "instance_type":         instance_type,
+                "gpu_class":             "none",
+                "preempted":             False,
+                "collected_at":          now - pd.Timedelta(minutes=i),
+            })
+
+    elif cloud == "azure":
+        # Azure spot prices via REST API
+        price = _get_azure_spot_price(instance_type, region)
+        now   = pd.Timestamp.now(tz="UTC")
+        for i in range(SEQUENCE_LEN + 10):
+            rows.append({
+                "price_usd_per_hr":      price,
+                "ondemand_price_usd_hr": price * 3,
+                "gpu_count":             0,
+                "vcpu_count":            0,
+                "ram_gb":                0.0,
+                "cloud":                 "azure",
+                "region":                region,
+                "availability_zone":     az,
+                "instance_type":         instance_type,
+                "gpu_class":             "none",
+                "preempted":             False,
+                "collected_at":          now - pd.Timedelta(minutes=i),
+            })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df["collected_at"] = pd.to_datetime(df["collected_at"], utc=True)
+    df = df.sort_values("collected_at").reset_index(drop=True)
+    return df
+
+
+def _get_aws_ondemand(instance_type: str) -> float:
+    """Approximate on-demand prices for discount ratio calculation."""
+    prices = {
+        "t3.small":     0.0208,
+        "t3.medium":    0.0416,
+        "g4dn.xlarge":  0.526,
+        "g4dn.2xlarge": 0.752,
+        "g5.xlarge":    1.006,
+        "p3.2xlarge":   3.060,
+    }
+    return prices.get(instance_type, 0.10)
+
+
+def _get_gcp_preemptible_price(instance_type: str, region: str) -> float:
+    """GCP preemptible prices (quasi-static)."""
+    prices = {
+        "e2-standard-4":  0.067,
+        "g2-standard-4":  0.2818,
+        "a2-highgpu-1g":  0.75,
+        "n1-standard-4":  0.048,
+    }
+    return prices.get(instance_type, 0.05)
+
+
+def _get_azure_spot_price(instance_type: str, region: str) -> float:
+    """
+    Fetch Azure spot price from Retail Prices API.
+    Falls back to approximate if API fails.
+    """
+    try:
+        import requests
+        url    = "https://prices.azure.com/api/retail/prices"
+        params = {
+            "$filter": (
+                f"serviceName eq 'Virtual Machines' and "
+                f"priceType eq 'Spot' and "
+                f"armRegionName eq '{region}' and "
+                f"armSkuName eq '{instance_type}'"
+            )
+        }
+        resp  = requests.get(url, params=params, timeout=5)
+        items = resp.json().get("Items", [])
+        if items:
+            return float(items[0]["retailPrice"])
+    except Exception:
+        pass
+    # Fallback approximations
+    fallbacks = {
+        "Standard_NC4as_T4_v3": 0.21,
+        "Standard_NC8as_T4_v3": 0.36,
+    }
+    return fallbacks.get(instance_type, 0.15)
+
+
+def score_instance_from_api(
+    cloud:         str,
+    region:        str,
+    az:            str,
+    instance_type: str,
+    bq_client=None,       # ← add this
+) -> float:
+    import torch
+
+    load_models()
+
+    print(f"[risk]   Fetching live prices: {cloud}/{instance_type}/{region}")
+    df_raw = _fetch_live_prices(cloud, region, az, instance_type)
+
+    # ── Fallback to BQ if live API didn't return enough ───────────
+    if (df_raw.empty or len(df_raw) < SEQUENCE_LEN) and bq_client is not None:
+        print(f"[risk]   Live API only returned {len(df_raw)} rows — "
+              f"falling back to BQ historical data")
+        df_bq = _fetch_bq_fallback(cloud, region, az, instance_type, bq_client)
+
+        if not df_raw.empty:
+            # Merge: BQ history as base, live rows on top (most recent wins)
+            df_raw = pd.concat([df_bq, df_raw], ignore_index=True)
+            df_raw = df_raw.sort_values("collected_at").drop_duplicates(
+                subset=["collected_at"], keep="last"
+            ).reset_index(drop=True)
+        else:
+            df_raw = df_bq
+
+    if df_raw.empty or len(df_raw) < SEQUENCE_LEN:
+        print(f"[risk]   Still not enough data ({len(df_raw)}) → returning 0.5")
+        return 0.5
+
+    df = _engineer_features(df_raw)
+
+    X_raw  = df[list(_feat_cols)].values.astype(np.float32)
+    X_sc   = _scaler.transform(X_raw)
+    X_seq  = X_sc[-SEQUENCE_LEN:]
+    X_flat = X_sc[-1]
+
+    seq_t = torch.tensor(X_seq).unsqueeze(0)
+    with torch.no_grad():
+        lstm_feats, lstm_logit = _lstm(seq_t)
+    lstm_feats = lstm_feats.squeeze(0).numpy()
+
+    X_hybrid = np.hstack([lstm_feats, X_flat]).reshape(1, -1)
+    risk     = float(np.clip(_xgb.predict(X_hybrid)[0], 0.0, 1.0))
+
+    print(f"[risk]   LSTM logit={lstm_logit.item():.4f}  risk={risk:.4f}")
+    return round(risk, 4)
+
+def _fetch_bq_fallback(cloud: str, region: str, az: str,
+                        instance_type: str, bq_client) -> pd.DataFrame:
+    """
+    Fallback: fetch historical rows for same instance/region across
+    past 7 days when live API doesn't return enough data.
+    """
+    from google.cloud.bigquery import QueryJobConfig, ScalarQueryParameter
+
+    PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "")
+    DATASET    = os.getenv("BIGQUERY_DATASET", "spot_prices")
+    TABLE      = os.getenv("BIGQUERY_TABLE",   "price_history")
+
+    RAW_COLS = [
+        "price_usd_per_hr", "ondemand_price_usd_hr",
+        "gpu_count", "vcpu_count", "ram_gb",
+        "cloud", "region", "availability_zone",
+        "instance_type", "gpu_class",
+        "preempted", "collected_at",
+    ]
+
+    query = f"""
+        SELECT {', '.join(RAW_COLS)}
+        FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
+        WHERE cloud         = @cloud
+          AND region        = @region
+          AND instance_type = @instance_type
+          AND collected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+        ORDER BY collected_at DESC
+        LIMIT {SEQUENCE_LEN + 10}
+    """
+    cfg = QueryJobConfig(query_parameters=[
+        ScalarQueryParameter("cloud",         "STRING", cloud),
+        ScalarQueryParameter("region",        "STRING", region),
+        ScalarQueryParameter("instance_type", "STRING", instance_type),
+    ])
+    rows = list(bq_client.query(query, job_config=cfg))
+    df = pd.DataFrame([dict(r) for r in rows])
+    print(f"[risk]   BQ fallback rows: {len(df)}")
+    return df
