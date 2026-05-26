@@ -221,77 +221,330 @@
 
 <!-- Modal -->
 <div class="modal-overlay" id="modal">
-  <div class="modal" style="width:540px">
+  <div class="modal" style="width:580px">
+
+    <!-- Header -->
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
       <div class="modal-title" style="margin-bottom:0">+ Submit Training Job</div>
-      <button onclick="closeModal()" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px;line-height:1">✕</button>
+      <button onclick="MODAL.close()" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px;line-height:1">✕</button>
     </div>
+
+    <!-- Step tabs -->
     <div style="display:flex;gap:0;margin-bottom:22px;border:1px solid var(--border);border-radius:6px;overflow:hidden">
-      <div class="step-tab active" id="tab-1" onclick="goStep(1)">1 · Task</div>
-      <div class="step-tab" id="tab-2" onclick="goStep(2)">2 · Dataset</div>
-      <div class="step-tab" id="tab-3" onclick="goStep(3)">3 · Model</div>
-      <div class="step-tab" id="tab-4" onclick="goStep(4)">4 · Compute</div>
+      <div class="step-tab active" id="tab-1" onclick="MODAL._goStep(1)">1 · Task</div>
+      <div class="step-tab"        id="tab-2" onclick="MODAL._goStep(2)">2 · Dataset</div>
+      <div class="step-tab"        id="tab-3" onclick="MODAL._goStep(3)">3 · Model</div>
+      <div class="step-tab"        id="tab-4" onclick="MODAL._goStep(4)">4 · Compute</div>
+      <div class="step-tab"        id="tab-5" onclick="MODAL._goStep(5)">5 · Review</div>
     </div>
+
+    <!-- ═══ STEP 1 · Task ════════════════════════════════════════════ -->
     <div class="step-panel" id="step-1">
       <div class="form-grid">
-        <div class="form-group full"><div class="form-label">Task Name</div><input class="form-input" id="f-taskname" placeholder="e.g. ResNet sweep run 1"/></div>
+
+        <div class="form-group full">
+          <div class="form-label">Task Name</div>
+          <input class="form-input" id="f-taskname" placeholder="e.g. ResNet sweep run 1"/>
+        </div>
+
         <div class="form-group full">
           <div class="form-label">Priority</div>
           <div style="display:flex;gap:8px;margin-top:2px">
-            <label class="priority-opt" id="pri-cheapest"><input type="radio" name="priority" value="cheapest" style="display:none"><div class="pri-box"><div class="pri-icon">$</div><div class="pri-label">Cheapest</div><div class="pri-sub">Ignore time</div></div></label>
-            <label class="priority-opt selected" id="pri-balanced"><input type="radio" name="priority" value="balanced" checked style="display:none"><div class="pri-box"><div class="pri-icon">⚖</div><div class="pri-label">Balanced</div><div class="pri-sub">Pareto optimal</div></div></label>
-            <label class="priority-opt" id="pri-fastest"><input type="radio" name="priority" value="fastest" style="display:none"><div class="pri-box"><div class="pri-icon">⚡</div><div class="pri-label">Fastest</div><div class="pri-sub">Ignore cost</div></div></label>
+            <label class="priority-opt" id="pri-cheapest">
+              <input type="radio" name="priority" value="cheapest" style="display:none">
+              <div class="pri-box"><div class="pri-icon">$</div><div class="pri-label">Cheapest</div><div class="pri-sub">Ignore time</div></div>
+            </label>
+            <label class="priority-opt selected" id="pri-balanced">
+              <input type="radio" name="priority" value="balanced" checked style="display:none">
+              <div class="pri-box"><div class="pri-icon">⚖</div><div class="pri-label">Balanced</div><div class="pri-sub">Pareto optimal</div></div>
+            </label>
+            <label class="priority-opt" id="pri-fastest">
+              <input type="radio" name="priority" value="fastest" style="display:none">
+              <div class="pri-box"><div class="pri-icon">⚡</div><div class="pri-label">Fastest</div><div class="pri-sub">Ignore cost</div></div>
+            </label>
           </div>
         </div>
-        <div class="form-group"><div class="form-label">Max Budget ($)</div><input class="form-input" id="f-budget" type="number" value="2.00" min="0.10" step="0.10"/></div>
-        <div class="form-group"><div class="form-label">Max Duration (hrs)</div><input class="form-input" id="f-maxhrs" type="number" value="6" min="1"/></div>
-      </div>
-    </div>
-    <div class="step-panel" id="step-2" style="display:none">
-      <div class="form-grid">
-        <div class="form-group full"><div class="form-label">Dataset</div><select class="form-select" id="f-dataset" onchange="updateDatasetMeta()"><option value="synthetic-500k">synthetic-500k · tabular</option><option value="synthetic-100k">synthetic-100k · tabular</option><option value="custom">+ Custom S3 path</option></select></div>
-        <div class="form-group full" id="dataset-meta-wrap"><div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:12px;display:grid;grid-template-columns:repeat(4,1fr);gap:10px"><div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:3px">ROWS</div><div style="font-family:var(--font-mono);font-size:14px;font-weight:600" id="ds-rows">500,000</div></div><div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:3px">FEATURES</div><div style="font-family:var(--font-mono);font-size:14px;font-weight:600" id="ds-features">50</div></div><div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:3px">CLASSES</div><div style="font-family:var(--font-mono);font-size:14px;font-weight:600" id="ds-classes">5</div></div><div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:3px">TASK</div><div style="font-family:var(--font-mono);font-size:14px;font-weight:600" id="ds-task">classif.</div></div></div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-top:6px" id="ds-path">s3://ml-scheduler-dataset/synthetic/train/</div></div>
-        <div class="form-group full" id="custom-s3-wrap" style="display:none"><div class="form-label">S3 Path</div><input class="form-input" id="f-s3path" placeholder="s3://your-bucket/dataset/"/><div class="form-label" style="margin-top:8px">Display Name</div><input class="form-input" id="f-dsname" placeholder="my-dataset-v1"/></div>
-        <div class="form-group"><div class="form-label">Input Dim</div><input class="form-input" id="f-inputdim" type="number" value="50"/></div>
-        <div class="form-group"><div class="form-label">Num Classes</div><input class="form-input" id="f-numclasses" type="number" value="5"/></div>
-      </div>
-    </div>
-    <div class="step-panel" id="step-3" style="display:none">
-      <div class="form-grid">
-        <div class="form-group"><div class="form-label">Learning Rate</div><select class="form-select" id="f-lr"><option value="0.001">0.001 (default)</option><option value="0.0005">0.0005</option><option value="0.01">0.01</option></select></div>
-        <div class="form-group"><div class="form-label">Hidden Dim</div><select class="form-select" id="f-hidden"><option value="128">128</option><option value="256" selected>256</option><option value="512">512</option></select></div>
-        <div class="form-group"><div class="form-label">Dropout</div><select class="form-select" id="f-dropout"><option value="0.1">0.1</option><option value="0.3" selected>0.3</option><option value="0.5">0.5</option></select></div>
-        <div class="form-group"><div class="form-label">Batch Size</div><select class="form-select" id="f-batch"><option value="64" selected>64</option><option value="128">128</option><option value="256">256</option></select></div>
-        <div class="form-group"><div class="form-label">Epochs</div><input class="form-input" id="f-epochs" type="number" value="50"/></div>
-        <div class="form-group"><div class="form-label">Checkpoint every N steps</div><input class="form-input" id="f-ckpt" type="number" value="50"/></div>
-      </div>
-    </div>
-    <div class="step-panel" id="step-4" style="display:none">
-      <div class="form-grid">
-        <div class="form-group full"><div class="form-label">Target Cloud</div><select class="form-select" id="f-cloud"><option value="auto">Auto — Pareto optimizer picks</option><option value="aws">AWS only</option><option value="gcp">GCP only</option><option value="azure">Azure only</option></select></div>
-        <div class="form-group"><div class="form-label">Instance Type</div>
-          <select class="form-select" id="f-instance">
-            <option value="e2-standard-4">e2-standard-4 · CPU · $0.067/hr (GCP)</option>
-            <option value="e2-standard-8">e2-standard-8 · CPU · $0.134/hr (GCP)</option>
-            <option value="n1-standard-4">n1-standard-4 · CPU · $0.095/hr (GCP)</option>
+
+        <div class="form-group">
+          <div class="form-label">Max Budget ($)</div>
+          <input class="form-input" id="f-budget" type="number" value="2.00" min="0.10" step="0.10"/>
+        </div>
+        <div class="form-group">
+          <div class="form-label">Max Duration (hrs)</div>
+          <input class="form-input" id="f-maxhrs" type="number" value="6" min="1"/>
+        </div>
+
+        <!-- Spot-Only -->
+        <div class="form-group">
+          <div class="form-label">Spot-Only</div>
+          <select class="form-select" id="f-spot-only" onchange="MODAL._onSpotOnlyChange()">
+            <option value="yes">Yes — spot only</option>
+            <option value="no">No — allow on-demand fallback</option>
           </select>
         </div>
-        <div class="form-group"><div class="form-label">Spot Fallback</div><select class="form-select" id="f-fallback"><option value="migrate">Migrate to cheaper cloud</option><option value="pause">Pause and wait</option><option value="ondemand">Switch to on-demand</option></select></div>
-        <div class="form-group full"><div class="form-label">Notes (optional)</div><input class="form-input" id="f-notes" placeholder="e.g. sweep run 3 · higher dropout"/></div>
-      </div>
-      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:14px;margin-top:4px">
-        <div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:1px">Job Summary</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-family:var(--font-mono);font-size:11px" id="summary-content"></div>
+
+        <!-- On-demand fallback duration — hidden unless spot-only = no -->
+        <div class="form-group" id="ondemand-fallback-wrap" style="display:none">
+          <div class="form-label">On-Demand Fallback Max (hrs)</div>
+          <input class="form-input" id="f-ondemand-hrs" type="number" value="1" min="0.5" step="0.5"/>
+        </div>
+
       </div>
     </div>
+
+    <!-- ═══ STEP 2 · Dataset ══════════════════════════════════════════ -->
+    <div class="step-panel" id="step-2" style="display:none">
+      <div class="form-grid">
+
+        <div class="form-group full">
+          <div class="form-label">Dataset</div>
+          <select class="form-select" id="f-dataset" onchange="MODAL.updateDatasetMeta()">
+            <option value="synthetic-500k">synthetic-500k · tabular</option>
+            <option value="synthetic-100k">synthetic-100k · tabular</option>
+            <option value="custom">+ Custom S3 path</option>
+          </select>
+        </div>
+
+        <div class="form-group full" id="dataset-meta-wrap">
+          <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:12px;display:grid;grid-template-columns:repeat(4,1fr);gap:10px">
+            <div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:3px">ROWS</div><div style="font-family:var(--font-mono);font-size:14px;font-weight:600" id="ds-rows">500,000</div></div>
+            <div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:3px">FEATURES</div><div style="font-family:var(--font-mono);font-size:14px;font-weight:600" id="ds-features">50</div></div>
+            <div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:3px">CLASSES</div><div style="font-family:var(--font-mono);font-size:14px;font-weight:600" id="ds-classes">5</div></div>
+            <div><div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:3px">TASK</div><div style="font-family:var(--font-mono);font-size:14px;font-weight:600" id="ds-task">classif.</div></div>
+          </div>
+          <div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-top:6px" id="ds-path">s3://ml-scheduler-dataset/synthetic/train/</div>
+        </div>
+
+        <div class="form-group full" id="custom-s3-wrap" style="display:none">
+          <div class="form-label">S3 Path</div>
+          <input class="form-input" id="f-s3path" placeholder="s3://your-bucket/dataset/"/>
+          <div class="form-label" style="margin-top:8px">Display Name</div>
+          <input class="form-input" id="f-dsname" placeholder="my-dataset-v1"/>
+        </div>
+
+        <div class="form-group">
+          <div class="form-label">Input Dim</div>
+          <input class="form-input" id="f-inputdim" type="number" value="50"/>
+        </div>
+        <div class="form-group">
+          <div class="form-label">Num Classes</div>
+          <input class="form-input" id="f-numclasses" type="number" value="5"/>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ═══ STEP 3 · Model & Training ════════════════════════════════ -->
+    <div class="step-panel" id="step-3" style="display:none">
+      <div class="form-grid">
+
+        <!-- Workload identity -->
+        <div class="form-group">
+          <div class="form-label">Model Architecture</div>
+          <select class="form-select" id="f-arch">
+            <option value="mlp">MLP</option>
+            <option value="transformer">Transformer</option>
+            <option value="cnn">CNN</option>
+            <option value="rnn">RNN</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <div class="form-label">Parameter Count</div>
+          <select class="form-select" id="f-params">
+            <option value="<1B">&lt;1B</option>
+            <option value="1-7B">1–7B</option>
+            <option value="7-70B">7–70B</option>
+            <option value="70B+">70B+</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <div class="form-label">Training Paradigm</div>
+          <select class="form-select" id="f-paradigm">
+            <option value="fine-tuning">Fine-tuning</option>
+            <option value="pre-training">Pre-training</option>
+            <option value="rl">Reinforcement Learning</option>
+            <option value="distillation">Distillation</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <div class="form-label">Precision</div>
+          <select class="form-select" id="f-precision">
+            <option value="fp16">fp16 (recommended)</option>
+            <option value="bf16">bf16</option>
+            <option value="fp32">fp32</option>
+            <option value="int8">int8</option>
+          </select>
+        </div>
+
+        <!-- Training mode toggle -->
+        <div class="form-group full">
+          <div class="form-label">Training Mode</div>
+          <select class="form-select" id="f-train-mode" onchange="MODAL._onTrainModeChange()">
+            <option value="manual">Manual — set hyperparams yourself</option>
+            <option value="sweep">Auto Sweep — Hyperband finds best config</option>
+          </select>
+        </div>
+
+        <!-- Manual fields -->
+        <div id="manual-fields" style="display:contents">
+          <div class="form-group">
+            <div class="form-label">Learning Rate</div>
+            <select class="form-select" id="f-lr">
+              <option value="0.001">0.001 (default)</option>
+              <option value="0.0005">0.0005</option>
+              <option value="0.01">0.01</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <div class="form-label">Hidden Dim</div>
+            <select class="form-select" id="f-hidden">
+              <option value="128">128</option>
+              <option value="256" selected>256</option>
+              <option value="512">512</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <div class="form-label">Dropout</div>
+            <select class="form-select" id="f-dropout">
+              <option value="0.1">0.1</option>
+              <option value="0.3" selected>0.3</option>
+              <option value="0.5">0.5</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <div class="form-label">Batch Size</div>
+            <select class="form-select" id="f-batch">
+              <option value="64" selected>64</option>
+              <option value="128">128</option>
+              <option value="256">256</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <div class="form-label">Epochs</div>
+            <input class="form-input" id="f-epochs" type="number" value="50"/>
+          </div>
+          <div class="form-group">
+            <div class="form-label">Max Rollback Steps</div>
+            <input class="form-input" id="f-ckpt" type="number" value="50" placeholder="Checkpoint every N steps"/>
+          </div>
+        </div>
+
+        <!-- Sweep fields -->
+        <div id="sweep-fields" style="display:none" class="form-group full">
+          <div class="form-grid" style="margin-top:0">
+            <div class="form-group">
+              <div class="form-label">LR Min</div>
+              <input class="form-input" id="f-sweep-lr-min" type="number" value="0.0001" step="0.0001"/>
+            </div>
+            <div class="form-group">
+              <div class="form-label">LR Max</div>
+              <input class="form-input" id="f-sweep-lr-max" type="number" value="0.01" step="0.001"/>
+            </div>
+            <div class="form-group full">
+              <div class="form-label">Hidden Dim options</div>
+              <div style="display:flex;gap:12px;margin-top:4px">
+                <label style="display:flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" name="sweep-hidden" value="128"> 128</label>
+                <label style="display:flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" name="sweep-hidden" value="256" checked> 256</label>
+                <label style="display:flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" name="sweep-hidden" value="512"> 512</label>
+              </div>
+            </div>
+            <div class="form-group">
+              <div class="form-label">Max Trials</div>
+              <input class="form-input" id="f-sweep-trials" type="number" value="5" min="2" max="20"/>
+            </div>
+            <div class="form-group">
+              <div class="form-label">Trial Budget ($)</div>
+              <input class="form-input" id="f-sweep-budget" type="number" value="5.00" min="1" step="0.5"/>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ═══ STEP 4 · Compute ══════════════════════════════════════════ -->
+    <div class="step-panel" id="step-4" style="display:none">
+      <div class="form-grid">
+
+        <!-- Preferred Clouds — multi-checkbox -->
+        <div class="form-group full">
+          <div class="form-label">Preferred Clouds</div>
+          <div style="display:flex;gap:16px;margin-top:4px">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" name="clouds" value="aws" checked> AWS</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" name="clouds" value="gcp" checked> GCP</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" name="clouds" value="azure" checked> Azure</label>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <div class="form-label">GPU Required</div>
+          <select class="form-select" id="f-gpu">
+            <option value="no">No — CPU is fine</option>
+            <option value="yes">Yes — GPU required</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <div class="form-label">Spot Fallback</div>
+          <select class="form-select" id="f-fallback">
+            <option value="migrate">Migrate to cheaper cloud</option>
+            <option value="pause">Pause and wait</option>
+            <option value="ondemand">Switch to on-demand</option>
+          </select>
+        </div>
+
+        <div class="form-group full">
+          <div class="form-label">Preferred Regions <span style="opacity:.5;font-weight:400">(optional, comma-separated)</span></div>
+          <input class="form-input" id="f-regions" placeholder="e.g. us-east-1, us-central1"/>
+        </div>
+
+        <!-- Carbon-Aware -->
+        <div class="form-group">
+          <div class="form-label">Carbon-Aware Scheduling</div>
+          <select class="form-select" id="f-carbon" onchange="MODAL._onCarbonChange()">
+            <option value="no">Disabled</option>
+            <option value="yes">Enabled — prefer low-carbon regions</option>
+          </select>
+        </div>
+
+        <div class="form-group" id="carbon-weight-wrap" style="display:none">
+          <div class="form-label">Carbon Weight</div>
+          <select class="form-select" id="f-carbon-weight">
+            <option value="light">Light — minor tiebreaker</option>
+            <option value="balanced" selected>Balanced — equal to cost</option>
+            <option value="strong">Strong — prioritize over cost</option>
+          </select>
+        </div>
+
+        <div class="form-group full">
+          <div class="form-label">Notes (optional)</div>
+          <input class="form-input" id="f-notes" placeholder="e.g. sweep run 3 · higher dropout"/>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ═══ STEP 5 · Review ═══════════════════════════════════════════ -->
+    <div class="step-panel" id="step-5" style="display:none">
+      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:14px">
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:1px">Job Summary</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-family:var(--font-mono);font-size:11px" id="summary-content"></div>
+      </div>
+    </div>
+
+    <!-- Footer buttons -->
     <div style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
-      <button class="btn btn-secondary" id="btn-back" onclick="prevStep()" style="display:none">← Back</button>
+      <button class="btn btn-secondary" id="btn-back" onclick="MODAL.prev()" style="display:none">← Back</button>
       <div style="flex:1"></div>
       <div style="display:flex;gap:10px">
-        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-primary" id="btn-next" onclick="nextStep()">Next →</button>
+        <button class="btn btn-secondary" onclick="MODAL.close()">Cancel</button>
+        <button class="btn btn-primary" id="btn-next" onclick="MODAL.next()">Next →</button>
       </div>
     </div>
+
   </div>
 </div>
 

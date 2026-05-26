@@ -254,7 +254,7 @@ def _fetch_rows(cloud, region, az, instance_type, bq_client) -> pd.DataFrame:
     """Fetch raw rows from BigQuery — only columns that exist in the table."""
     from google.cloud.bigquery import QueryJobConfig, ScalarQueryParameter
 
-    PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "")
+    PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "tensile-method-459009-k2")
     DATASET    = os.getenv("BIGQUERY_DATASET", "spot_prices")
     TABLE      = os.getenv("BIGQUERY_TABLE",   "price_history")
 
@@ -345,7 +345,7 @@ def score_instance(cloud, region, az, instance_type, bq_client) -> float:
 def score_all_instances(bq_client) -> list[dict]:
     """Score every distinct active instance. Returns list sorted by risk desc."""
     
-    PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "")
+    PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "tensile-method-459009-k2")
     DATASET    = os.getenv("BIGQUERY_DATASET", "spot_prices")
     TABLE      = os.getenv("BIGQUERY_TABLE",   "price_history")
 
@@ -439,7 +439,7 @@ def _fetch_live_prices(cloud: str, region: str, az: str,
         params = {
             "InstanceTypes": [instance_type],
             "ProductDescriptions": ["Linux/UNIX"],
-            "StartTime": datetime.now(timezone.utc) - timedelta(hours=72),
+            "StartTime": datetime.now(timezone.utc) - timedelta(hours=1080),#45 days
             "MaxResults": 100,
         }
 
@@ -632,7 +632,7 @@ def _fetch_bq_fallback(cloud: str, region: str, az: str,
     """
     from google.cloud.bigquery import QueryJobConfig, ScalarQueryParameter
 
-    PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "")
+    PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "tensile-method-459009-k2")
     DATASET    = os.getenv("BIGQUERY_DATASET", "spot_prices")
     TABLE      = os.getenv("BIGQUERY_TABLE",   "price_history")
 

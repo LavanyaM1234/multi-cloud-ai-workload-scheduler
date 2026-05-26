@@ -67,11 +67,11 @@ app = Flask(
 CORS(app)
 
 # ── Config ─────────────────────────────────────────────────────────
-PROJECT_ID  = os.getenv("GCP_PROJECT_ID",         "")
-DATASET     = os.getenv("BIGQUERY_DATASET",        "")
-TABLE       = os.getenv("BIGQUERY_TABLE",          "")
-GCS_BUCKET  = os.getenv("CHECKPOINT_GCS_BUCKET",   "")
-GCP_ZONE    = os.getenv("GCP_ZONE",                "")
+PROJECT_ID  = os.getenv("GCP_PROJECT_ID",         "tensile-method-459009-k2")
+DATASET     = os.getenv("BIGQUERY_DATASET",        "spot_prices")
+TABLE       = os.getenv("BIGQUERY_TABLE",          "price_history")
+GCS_BUCKET  = os.getenv("CHECKPOINT_GCS_BUCKET",   "ml-scheduler-jobs-tensile-method-459009-k2")
+GCP_ZONE    = os.getenv("GCP_ZONE",                "us-central1-a")
 
 POLLER_INTERVAL = 30
 MAX_MIGRATIONS  = 5
@@ -137,8 +137,10 @@ def gcs_list_job_states():
 class PreemptionPoller(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
-        self._stop_event = threading.Event()
-        self._resuming   = set()
+        self._stop_event      = threading.Event()
+        self._resuming        = set()
+        # Track when each job switched to on-demand {job_id: datetime}
+        self._ondemand_since  = {}
 
     def stop(self):
         self._stop_event.set()
@@ -159,14 +161,73 @@ class PreemptionPoller(threading.Thread):
         for state in states:
             job_id = state.get("job_id")
             status = state.get("status")
+
+            # ── Preemption → relaunch ─────────────────────────────
             if status == "preempted" and job_id not in self._resuming:
                 self._resuming.add(job_id)
                 print(f"\n[poller] Detected preempted job: {job_id}")
-                t = threading.Thread(target=self._migrate, args=(job_id, state), daemon=True)
+                t = threading.Thread(
+                    target=self._migrate, args=(job_id, state), daemon=True
+                )
                 t.start()
+
+            # ── On-demand timeout check ───────────────────────────
+            # If a job is running on an on-demand instance AND the user
+            # set spot_only=False with ondemand_max_hrs, enforce the limit.
+            elif status == "running" and state.get("is_spot") is False:
+                self._check_ondemand_timeout(job_id, state)
+
+            # ── Cleanup resuming set ──────────────────────────────
             if status in ("running", "done", "budget_exceeded", "launch_failed") \
                     and job_id in self._resuming:
                 self._resuming.discard(job_id)
+
+            # Clear on-demand tracker when job finishes or goes back to spot
+            if status in ("done", "failed", "budget_exceeded") \
+                    and job_id in self._ondemand_since:
+                del self._ondemand_since[job_id]
+
+    def _check_ondemand_timeout(self, job_id: str, state: dict):
+        """
+        If a running job is on on-demand and has exceeded ondemand_max_hrs,
+        write a 'migrate' command to GCS so train.py picks it up and
+        triggers a checkpoint + exit, after which the poller relaunches
+        on a spot instance.
+        """
+        try:
+            config           = gcs_read_json(f"checkpoints/{job_id}/job_config.json")
+            spot_only        = config.get("spot_only", True)
+            ondemand_max_hrs = float(config.get("ondemand_max_hrs", 1.0))
+
+            # If spot_only=True, on-demand should never have been used — skip
+            if spot_only:
+                return
+
+            now = datetime.now(timezone.utc)
+
+            # Record when we first noticed this job on on-demand
+            if job_id not in self._ondemand_since:
+                self._ondemand_since[job_id] = now
+                print(f"[poller] {job_id} running on on-demand — "
+                      f"max allowed: {ondemand_max_hrs}h")
+                return
+
+            elapsed_hrs = (now - self._ondemand_since[job_id]).total_seconds() / 3600
+
+            if elapsed_hrs >= ondemand_max_hrs:
+                print(f"[poller] {job_id} on-demand limit reached "
+                      f"({elapsed_hrs:.2f}h >= {ondemand_max_hrs}h) — "
+                      f"sending migrate command")
+                # Write migrate command — train.py checks this every epoch
+                gcs_write_json(
+                    f"checkpoints/{job_id}/job_command.json",
+                    {"command": "migrate", "reason": "ondemand_max_hrs_exceeded"}
+                )
+                # Remove from tracker — migrate will handle relaunch on spot
+                del self._ondemand_since[job_id]
+
+        except Exception as e:
+            print(f"[poller] _check_ondemand_timeout error for {job_id}: {e}")
 
     def _migrate(self, job_id, state):
         try:
@@ -176,6 +237,7 @@ class PreemptionPoller(threading.Thread):
                 config = gcs_read_json(f"checkpoints/{job_id}/job_config.json")
             except Exception:
                 config = {}
+
             migration_count = config.get("migration_count", 0)
             if migration_count >= MAX_MIGRATIONS:
                 print(f"[poller] Job {job_id} hit migration limit — marking failed")
@@ -187,19 +249,42 @@ class PreemptionPoller(threading.Thread):
                 })
                 self._resuming.discard(job_id)
                 return
+
             resume_step     = state.get("step", 0)
             prev_cloud      = state.get("cloud", "gcp")
             cost_so_far     = float(state.get("cost_usd", 0))
             original_budget = float(config.get("max_budget", 2.0))
             remaining       = max(0.10, original_budget - cost_so_far)
-            decision        = pick_best_cloud({
-                "job_id": job_id, "max_budget": remaining,
-                "deadline_hrs": config.get("deadline_hrs", 8.0),
+
+            # ── Pass full user preferences from original config ───
+            # Old code only passed job_id, max_budget, deadline_hrs —
+            # meaning preferred_clouds, spot_only, carbon_aware etc.
+            # were all ignored on every relaunch after preemption.
+            decision = pick_best_cloud({
+                "job_id":           job_id,
+                "max_budget":       remaining,
+                "deadline_hrs":     config.get("deadline_hrs",     8.0),
+                "priority":         config.get("priority",         "balanced"),
+                "spot_only":        config.get("spot_only",        True),
+                "ondemand_max_hrs": config.get("ondemand_max_hrs", 1.0),
+                "preferred_clouds": config.get("preferred_clouds", ["aws", "gcp", "azure"]),
+                "preferred_regions":config.get("preferred_regions",""),
+                "gpu_required":     config.get("gpu_required",     False),
+                "min_gpu_mem":      config.get("min_gpu_mem",      0),
+                "carbon_aware":     config.get("carbon_aware",     False),
+                "carbon_weight":    config.get("carbon_weight",    "balanced"),
+                # Training fields needed for est_hours calculation
+                "epochs":           config.get("epochs",           50),
+                "batch_size":       config.get("batch_size",       64),
+                "dataset_type":     config.get("dataset_type",     "synthetic-500k"),
+                "synthetic_rows":   config.get("synthetic_rows",   500000),
             })
+
             result = resume_job(job_id=job_id, resume_step=resume_step,
                                 prev_cloud=prev_cloud, decision=decision)
             if result.get("launched"):
-                print(f"[poller] ✓ {job_id} relaunched on {result['cloud']}")
+                print(f"[poller] ✓ {job_id} relaunched on {result['cloud']} "
+                      f"(preferred: {config.get('preferred_clouds','any')})")
             else:
                 print(f"[poller] ✗ {job_id} relaunch failed: {result.get('error')}")
                 self._resuming.discard(job_id)
