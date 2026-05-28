@@ -1,0 +1,100 @@
+{
+  "job-0524-jje48t": {
+    "launch_result": {
+      "cloud": "gcp",
+      "instance_name": "ml-job-job-0524-jje48t-1779597795",
+      "instance_id": "6399911795636518664",
+      "instance_type": "e2-standard-4",
+      "zone": "us-central1-a",
+      "internal_ip": "10.128.0.10",
+      "status": "RUNNING",
+      "checkpoint_bucket": "ml-scheduler-jobs-tensile-method-459009-k2",
+      "launched_at": "2026-05-24T04:43:28.693602+00:00"
+    },
+    "updated_at": "2026-05-24T04:43:28.693835+00:00"
+  },
+  "job-0524-oii295": {
+    "launch_result": {
+      "cloud": "gcp",
+      "instance_name": "ml-job-job-0524-oii295-1779602554",
+      "instance_id": "1028953551587453585",
+      "instance_type": "e2-standard-4",
+      "zone": "us-central1-a",
+      "internal_ip": "10.128.0.11",
+      "status": "RUNNING",
+      "checkpoint_bucket": "ml-scheduler-jobs-tensile-method-459009-k2",
+      "launched_at": "2026-05-24T06:03:03.741788+00:00"
+    },
+    "updated_at": "2026-05-24T06:03:03.749911+00:00"
+  },
+  "job-0524-uteaok": {
+    "launch_result": {
+      "cloud": "gcp",
+      "instance_name": "ml-job-job-0524-uteaok-1779603597",
+      "instance_id": "958076536685012606",
+      "instance_type": "e2-standard-4",
+      "zone": "us-central1-a",
+      "internal_ip": "10.128.0.12",
+      "status": "RUNNING",
+      "checkpoint_bucket": "ml-scheduler-jobs-tensile-method-459009-k2",
+      "launched_at": "2026-05-24T06:20:15.747490+00:00"
+    },
+    "updated_at": "2026-05-24T06:20:15.755745+00:00"
+  },
+  "job-0524-te3w4i": {
+    "launch_result": {
+      "cloud": "gcp",
+      "instance_name": "ml-job-job-0524-te3w4i-1779610971",
+      "instance_id": "1162438936123870128",
+      "instance_type": "e2-standard-4",
+      "zone": "us-central1-a",
+      "internal_ip": "10.128.0.13",
+      "status": "RUNNING",
+      "checkpoint_bucket": "ml-scheduler-jobs-tensile-method-459009-k2",
+      "launched_at": "2026-05-24T08:23:10.419328+00:00"
+    },
+    "updated_at": "2026-05-24T08:23:10.454577+00:00"
+  },
+  "job-0524-ke23du": {
+    "launch_result": {
+      "cloud": "aws",
+      "instance_id": "i-0e76bd107f7f906f7",
+      "instance_type": "t3.micro",
+      "region": "us-east-1",
+      "public_ip": "34.205.75.215",
+      "private_ip": "172.31.1.173",
+      "status": "running",
+      "s3_bucket": "ml-scheduler-checkpoints",
+      "launched_at": "2026-05-24T16:05:21.285726+00:00"
+    },
+    "updated_at": "2026-05-24T16:05:21.311599+00:00"
+  },
+  "job-0524-xlkixl": {
+    "launch_result": {
+      "cloud": "aws",
+      "instance_id": "i-090b69e2377ec5557",
+      "instance_type": "t3.micro",
+      "region": "us-east-1",
+      "public_ip": "98.92.177.48",
+      "private_ip": "172.31.1.57",
+      "status": "running",
+      "s3_bucket": "ml-scheduler-checkpoints",
+      "launched_at": "2026-05-24T16:12:12.103898+00:00"
+    },
+    "updated_at": "2026-05-24T16:12:12.126092+00:00"
+  },
+  "job-0524-fw67hs": {
+    "launch_result": {
+      "cloud": "aws",
+      "instance_id": "i-04d942440ac44dbc5",
+      "instance_type": "t3.micro",
+      "region": "us-east-1",
+      "public_ip": "13.223.101.131",
+      "private_ip": "172.31.8.196",
+      "status": "running",
+      "s3_bucket": "ml-scheduler-checkpoints",
+      "launched_at": "2026-05-24T16:18:57.207884+00:00"
+    },
+    "updated_at": "2026-05-24T16:18:57.270779+00:00"
+  }
+}

@@ -1,23 +1,36 @@
-#!/usr/bin/env python3
 """
 trainer/train.py
 ─────────────────
 Training script that runs on the spawned VM.
-Reads job_config.json from GCS, trains the model, checkpoints every N steps.
+Reads job_config.json from S3, trains the model, checkpoints every N steps.
 
-New in this version:
-  - model_arch: MLP / Transformer / CNN / RNN (was always MLP)
+Features:
+  - model_arch: MLP / Transformer / CNN / RNN
   - precision:  fp32 / fp16 / bf16 / int8
   - train_mode: manual (existing) / sweep (Hyperband over lr + hidden_dim)
+  - training_paradigm: fine-tuning / pre-training / rl / distillation
 
 Flow:
-  1. Load job_config.json from GCS
+  1. Load job_config.json from S3
   2. Apply precision (cast model)
   3. Build model from model_arch
   4. If train_mode=sweep → run Hyperband, pick best config, train final model
      If train_mode=manual → existing training loop unchanged
-  5. Checkpoint every ckpt_every steps to GCS + S3
+  5. Checkpoint every ckpt_every steps to S3
   6. On preemption / budget exceeded → write terminal state → poller relaunches
+
+Commands (written by server.py to S3, consumed once):
+    migrate    → save checkpoint, exit with status=preempted
+    stop       → save final checkpoint, exit cleanly
+    reduce_lr  → multiply all param group LRs by 0.1, continue training
+
+All checkpoint files written to S3:
+  checkpoints/{job_id}/
+    job_config.json            ← written by launcher before VM starts
+    job_state.json             ← updated by engine after every save
+    job_command.json           ← written by server.py, consumed here
+    checkpoint_latest.pt       ← always latest, used by engine.load()
+    step_{N:08d}.pt            ← milestone saves every ckpt_every steps
 """
 
 import os, sys, json, time, asyncio, math
@@ -32,31 +45,78 @@ except ImportError:
     print("[ERROR] pip install torch --index-url https://download.pytorch.org/whl/cpu")
     sys.exit(1)
 
-try:
-    from google.cloud import storage as gcs_lib
-    GCS_OK = True
-except ImportError:
-    GCS_OK = False
-    print("[WARN] pip install google-cloud-storage")
+
+# ══════════════════════════════════════════════════════════════════
+# S3 CLIENT HELPER
+# ══════════════════════════════════════════════════════════════════
+
+def _s3_client():
+    import boto3
+    return boto3.client(
+        "s3",
+        aws_access_key_id     = os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        region_name           = os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+    )
+
+
+def _s3_read_json(s3_path: str):
+    """Read a JSON file from S3. Returns dict or None on any error."""
+    bucket = os.environ.get("CHECKPOINT_S3_BUCKET", "")
+    if not bucket:
+        return None
+    try:
+        obj  = _s3_client().get_object(Bucket=bucket, Key=s3_path)
+        return json.loads(obj["Body"].read().decode())
+    except Exception as e:
+        print(f"[s3] read_json({s3_path}) failed: {e}")
+        return None
+
+
+def _s3_delete(s3_path: str):
+    """Delete a key from S3 (used to consume job_command.json)."""
+    bucket = os.environ.get("CHECKPOINT_S3_BUCKET", "")
+    if not bucket:
+        return
+    try:
+        _s3_client().delete_object(Bucket=bucket, Key=s3_path)
+    except Exception as e:
+        print(f"[s3] delete({s3_path}) failed: {e}")
+
+
+def _s3_key_exists(s3_path: str) -> bool:
+    bucket = os.environ.get("CHECKPOINT_S3_BUCKET", "")
+    if not bucket:
+        return False
+    try:
+        _s3_client().head_object(Bucket=bucket, Key=s3_path)
+        return True
+    except Exception:
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════
-# CONFIG
+# CONFIG  — read job_config.json from S3
 # ══════════════════════════════════════════════════════════════════
 
 def load_config() -> dict:
-    bucket = os.environ.get("GCS_BUCKET", "")
-    job_id = os.environ.get("JOB_ID",     "local-test")
+    """
+    Load job config written by launcher.submit_job() before this VM booted.
+    Reads from S3: s3://CHECKPOINT_S3_BUCKET/checkpoints/{job_id}/job_config.json
+    Fallback: local job_config.json for local testing.
+    """
+    job_id = os.environ.get("JOB_ID", "local-test")
+    bucket = os.environ.get("CHECKPOINT_S3_BUCKET", "")
+
     config = None
 
-    if bucket and GCS_OK:
-        try:
-            blob   = gcs_lib.Client().bucket(bucket).blob(
-                        f"checkpoints/{job_id}/job_config.json")
-            config = json.loads(blob.download_as_text())
-            print(f"[config] Loaded from GCS: checkpoints/{job_id}/job_config.json")
-        except Exception as e:
-            print(f"[config] GCS read failed: {e}")
+    if bucket:
+        s3_key = f"checkpoints/{job_id}/job_config.json"
+        config = _s3_read_json(s3_key)
+        if config:
+            print(f"[config] Loaded from S3: s3://{bucket}/{s3_key}")
+        else:
+            print(f"[config] S3 read failed for {s3_key}")
 
     if config is None and os.path.exists("job_config.json"):
         with open("job_config.json") as f:
@@ -80,8 +140,7 @@ def load_config() -> dict:
     config.setdefault("input_dim",         50)
     config.setdefault("num_classes",       5)
     config.setdefault("max_budget",        2.0)
-    config.setdefault("gcs_bucket",        bucket)
-    config.setdefault("price_usd_hr",      0.067)
+    config.setdefault("price_usd_hr",      0.034)
     config.setdefault("migration_count",   0)
     config.setdefault("model_arch",        "mlp")
     config.setdefault("precision",         "fp32")
@@ -91,9 +150,11 @@ def load_config() -> dict:
     config.setdefault("sweep_hidden",      [256])
     config.setdefault("sweep_trials",      5)
     config.setdefault("sweep_budget",      5.0)
+    config.setdefault("dataset_type",      "synthetic-500k")
+    config.setdefault("s3_dataset_path",   "")
 
-    if os.environ.get("JOB_ID"):     config["job_id"]     = os.environ["JOB_ID"]
-    if os.environ.get("GCS_BUCKET"): config["gcs_bucket"] = os.environ["GCS_BUCKET"]
+    if os.environ.get("JOB_ID"):
+        config["job_id"] = os.environ["JOB_ID"]
 
     return config
 
@@ -103,11 +164,7 @@ def load_config() -> dict:
 # ══════════════════════════════════════════════════════════════════
 
 def apply_precision(model: nn.Module, precision: str, device: torch.device):
-    """
-    Cast model to the requested precision.
-    int8 uses dynamic quantization (CPU only — no GPU int8 training).
-    bf16 falls back to fp16 if not supported by the device.
-    """
+    """Cast model to the requested precision."""
     precision = precision.lower()
 
     if precision == "fp16":
@@ -119,17 +176,14 @@ def apply_precision(model: nn.Module, precision: str, device: torch.device):
             model = model.to(device).to(torch.bfloat16)
             print(f"[precision] bf16 — model cast to bfloat16")
         else:
-            # bf16 not supported — fall back to fp16
             model = model.to(device).half()
             print(f"[precision] bf16 requested but not supported — falling back to fp16")
 
     elif precision == "int8":
-        # Dynamic quantization — inference only, training stays fp32
-        # We apply it after training in a real pipeline; here we note it
         model = model.to(device)
         print(f"[precision] int8 — training in fp32, quantization applied post-training")
 
-    else:  # fp32 default
+    else:
         model = model.to(device).float()
         print(f"[precision] fp32 — standard float32")
 
@@ -137,14 +191,10 @@ def apply_precision(model: nn.Module, precision: str, device: torch.device):
 
 
 def get_autocast_context(precision: str, device: torch.device):
-    """
-    Returns a context manager for mixed precision forward passes.
-    Use with `with get_autocast_context(...):` around forward + loss.
-    """
+    """Returns a context manager for mixed precision forward passes."""
     if precision in ("fp16", "bf16") and device.type == "cuda":
         dtype = torch.float16 if precision == "fp16" else torch.bfloat16
         return torch.amp.autocast(device_type="cuda", dtype=dtype)
-    # CPU or fp32 — no-op context
     import contextlib
     return contextlib.nullcontext()
 
@@ -179,20 +229,15 @@ class MLP(nn.Module):
 
 
 class TabularTransformer(nn.Module):
-    """
-    Transformer for tabular data.
-    Each feature is treated as a token — linear projection → positional → transformer.
-    """
     def __init__(self, in_dim, hidden, out_dim, dropout, n_heads=4, n_layers=2):
         super().__init__()
-        # Project each scalar feature to hidden_dim
         self.embed   = nn.Linear(1, hidden)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden, nhead=n_heads, dim_feedforward=hidden * 2,
             dropout=dropout, batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.pool    = nn.AdaptiveAvgPool1d(1)   # pool over feature tokens
+        self.pool    = nn.AdaptiveAvgPool1d(1)
         self.head    = nn.Sequential(
             nn.Linear(hidden, hidden // 2), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden // 2, out_dim)
@@ -200,20 +245,15 @@ class TabularTransformer(nn.Module):
         self.in_dim  = in_dim
 
     def forward(self, x):
-        # x: (B, in_dim) → (B, in_dim, 1) → embed → (B, in_dim, hidden)
-        x = x.unsqueeze(-1)                      # (B, F, 1)
-        x = self.embed(x)                        # (B, F, hidden)
-        x = self.transformer(x)                  # (B, F, hidden)
-        x = x.transpose(1, 2)                    # (B, hidden, F)
-        x = self.pool(x).squeeze(-1)             # (B, hidden)
-        return self.head(x)                      # (B, out_dim)
+        x = x.unsqueeze(-1)
+        x = self.embed(x)
+        x = self.transformer(x)
+        x = x.transpose(1, 2)
+        x = self.pool(x).squeeze(-1)
+        return self.head(x)
 
 
 class CNN1D(nn.Module):
-    """
-    1D CNN treating input features as a sequence.
-    Good for data with local correlations between adjacent features.
-    """
     def __init__(self, in_dim, hidden, out_dim, dropout):
         super().__init__()
         self.conv = nn.Sequential(
@@ -228,15 +268,12 @@ class CNN1D(nn.Module):
         )
 
     def forward(self, x):
-        x = x.unsqueeze(1)     # (B, 1, F)
-        x = self.conv(x)       # (B, hidden, 1)
+        x = x.unsqueeze(1)
+        x = self.conv(x)
         return self.head(x)
 
 
 class RNNClassifier(nn.Module):
-    """
-    GRU-based classifier. Treats each feature as a timestep.
-    """
     def __init__(self, in_dim, hidden, out_dim, dropout, n_layers=2):
         super().__init__()
         self.gru  = nn.GRU(
@@ -250,16 +287,12 @@ class RNNClassifier(nn.Module):
         )
 
     def forward(self, x):
-        x = x.unsqueeze(-1)          # (B, F, 1)
-        _, h = self.gru(x)           # h: (layers, B, hidden)
-        return self.head(h[-1])      # last layer hidden state
+        x = x.unsqueeze(-1)
+        _, h = self.gru(x)
+        return self.head(h[-1])
 
 
 def build_model(cfg: dict) -> nn.Module:
-    """
-    Instantiate model from model_arch config field.
-    Supported: mlp, transformer, cnn, rnn
-    """
     arch    = cfg.get("model_arch", "mlp").lower()
     in_dim  = int(cfg["input_dim"])
     hidden  = int(cfg["hidden_dim"])
@@ -267,20 +300,16 @@ def build_model(cfg: dict) -> nn.Module:
     dropout = float(cfg["dropout"])
 
     if arch == "transformer":
-        # n_heads must divide hidden — clamp to safe value
         n_heads = 4 if hidden >= 64 else 2 if hidden >= 32 else 1
         model   = TabularTransformer(in_dim, hidden, out_dim, dropout, n_heads=n_heads)
         print(f"[model] TabularTransformer — hidden={hidden} heads={n_heads}")
-
     elif arch == "cnn":
         model = CNN1D(in_dim, hidden, out_dim, dropout)
         print(f"[model] CNN1D — hidden={hidden}")
-
     elif arch == "rnn":
         model = RNNClassifier(in_dim, hidden, out_dim, dropout)
         print(f"[model] RNNClassifier (GRU) — hidden={hidden}")
-
-    else:  # default: mlp
+    else:
         model = MLP(in_dim, hidden, out_dim, dropout)
         print(f"[model] MLP — hidden={hidden}")
 
@@ -290,22 +319,27 @@ def build_model(cfg: dict) -> nn.Module:
 
 
 # ══════════════════════════════════════════════════════════════════
-# COMMAND / PREEMPTION / BUDGET CHECKS  (unchanged)
+# COMMAND / PREEMPTION / BUDGET CHECKS
 # ══════════════════════════════════════════════════════════════════
 
-def check_command(cfg: dict) -> str | None:
-    if not GCS_OK or not cfg.get("gcs_bucket"):
+def check_command(cfg: dict):
+    """
+    Check S3 for a command written by server.py.
+    Returns command string or None. Deletes the file after reading.
+    """
+    s3_key = f"checkpoints/{cfg['job_id']}/job_command.json"
+    if not _s3_key_exists(s3_key):
         return None
     try:
-        bucket = gcs_lib.Client().bucket(cfg["gcs_bucket"])
-        blob   = bucket.blob(f"checkpoints/{cfg['job_id']}/job_command.json")
-        if not blob.exists():
+        data = _s3_read_json(s3_key)
+        if not data:
             return None
-        cmd = json.loads(blob.download_as_text()).get("command")
-        blob.delete()
+        cmd = data.get("command")
+        _s3_delete(s3_key)
         print(f"[command] Received: {cmd}")
         return cmd
-    except Exception:
+    except Exception as e:
+        print(f"[command] check_command failed: {e}")
         return None
 
 
@@ -333,29 +367,28 @@ def runtime_stats(cfg: dict, start_time: float) -> dict:
     return {
         "elapsed_hrs": round(elapsed_hrs, 4),
         "cost_usd":    round(elapsed_hrs * float(cfg["price_usd_hr"]), 4),
-        "cloud":       os.environ.get("CLOUD",         "gcp"),
-        "instance":    os.environ.get("INSTANCE_TYPE", "e2-standard-4"),
+        "cloud":       os.environ.get("CLOUD",         "unknown"),
+        "instance":    os.environ.get("INSTANCE_TYPE", "unknown"),
     }
 
 
 # ══════════════════════════════════════════════════════════════════
-# DATASET  (unchanged)
+# DATASET
 # ══════════════════════════════════════════════════════════════════
 
 def _download_s3_dataset(s3_path: str, local_dir: str) -> list:
-    import boto3, re
+    """Download all CSV files from an S3 path prefix to local_dir."""
+    import re
     from pathlib import Path
     match = re.match(r"s3://([^/]+)/?(.*)", s3_path.rstrip("/") + "/")
     if not match:
         raise ValueError(f"Invalid S3 path: {s3_path!r}")
     bucket_name = match.group(1)
     prefix      = match.group(2)
-    s3 = boto3.client(
-        "s3",
-        aws_access_key_id     = os.environ.get("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        region_name           = os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-    )
+
+    print(f"[data] Connecting to S3 bucket: {bucket_name}  prefix: {prefix!r}")
+    s3 = _s3_client()
+
     Path(local_dir).mkdir(parents=True, exist_ok=True)
     paginator   = s3.get_paginator("list_objects_v2")
     local_files = []
@@ -411,24 +444,15 @@ def make_dataset(cfg: dict):
 
 # ══════════════════════════════════════════════════════════════════
 # HYPERBAND SWEEP
-# Successive Halving: run n_trials for budget/n_trials steps each,
-# keep top half, repeat with more steps until one winner remains.
 # ══════════════════════════════════════════════════════════════════
 
 def _sample_configs(cfg: dict) -> list[dict]:
-    """
-    Generate trial configs by grid-searching lr × hidden_dim.
-    sweep_lr_min/max split into sweep_trials evenly on log scale.
-    sweep_hidden: list of hidden dims to try.
-    """
     import random
-
     lr_min    = float(cfg["sweep_lr_min"])
     lr_max    = float(cfg["sweep_lr_max"])
     hiddens   = [int(h) for h in cfg.get("sweep_hidden", [256])]
     n_trials  = int(cfg["sweep_trials"])
 
-    # Log-uniform LR samples
     log_lrs = [
         math.exp(math.log(lr_min) + i * (math.log(lr_max) - math.log(lr_min)) / max(n_trials - 1, 1))
         for i in range(n_trials)
@@ -448,10 +472,7 @@ def _sample_configs(cfg: dict) -> list[dict]:
 
 def _train_trial(trial_cfg: dict, train_loader, val_loader,
                  steps: int, device: torch.device) -> tuple[float, dict]:
-    """
-    Train a single Hyperband trial for `steps` gradient steps.
-    Returns (val_loss, trial_cfg).
-    """
+    """Train a single Hyperband trial for `steps` gradient steps."""
     precision = trial_cfg.get("precision", "fp32")
     model     = build_model(trial_cfg)
     model     = apply_precision(model, precision, device)
@@ -472,7 +493,6 @@ def _train_trial(trial_cfg: dict, train_loader, val_loader,
         optimizer.step()
         step += 1
 
-    # Validate
     model.eval()
     v_loss = 0.0
     with torch.no_grad():
@@ -491,28 +511,21 @@ def _train_trial(trial_cfg: dict, train_loader, val_loader,
 
 def run_hyperband(cfg: dict, train_loader, val_loader, device: torch.device) -> dict:
     """
-    Successive Halving (Hyperband bracket 0):
-      - Start with n_trials configs, each trained for min_steps steps
-      - Each round: halve the survivors, double the steps
-      - Stop when 1 config remains or budget exhausted
-
+    Successive Halving (Hyperband bracket 0).
     Returns the best config dict to use for final training.
     """
-    n_trials   = int(cfg["sweep_trials"])
-    # Budget in steps: divide sweep_budget by price to get hours, hours × steps_per_hr
-    # Simpler: use epochs=3 as the min unit for each trial
-    min_steps  = max(10, len(train_loader) // 2)   # half an epoch per trial minimum
-    eta        = 3    # halving factor
-
-    trials     = _sample_configs(cfg)
-    n_rounds   = math.ceil(math.log(n_trials, eta))
+    n_trials  = int(cfg["sweep_trials"])
+    min_steps = max(10, len(train_loader) // 2)
+    eta       = 3
+    trials    = _sample_configs(cfg)
+    n_rounds  = math.ceil(math.log(n_trials, eta))
 
     print(f"\n[sweep] Hyperband: {n_trials} trials  "
           f"{n_rounds} rounds  min_steps={min_steps}  eta={eta}")
 
     for rnd in range(n_rounds):
-        steps     = min_steps * (eta ** rnd)
-        n_keep    = max(1, math.ceil(len(trials) / eta))
+        steps  = min_steps * (eta ** rnd)
+        n_keep = max(1, math.ceil(len(trials) / eta))
         print(f"\n[sweep] Round {rnd+1}/{n_rounds}: "
               f"{len(trials)} trials × {int(steps)} steps → keep top {n_keep}")
 
@@ -522,7 +535,7 @@ def run_hyperband(cfg: dict, train_loader, val_loader, device: torch.device) -> 
                                         int(steps), device)
             scored.append((val_loss, tc))
 
-        scored.sort(key=lambda x: x[0])   # lower val_loss = better
+        scored.sort(key=lambda x: x[0])
         trials = [tc for _, tc in scored[:n_keep]]
 
         if len(trials) == 1:
@@ -544,10 +557,7 @@ def _run_training_loop(cfg: dict, model: nn.Module, optimizer, criterion,
                        start_epoch: int, global_step: int, resumed_from: int,
                        start_time: float, device: torch.device,
                        precision: str) -> tuple[bool, float, float]:
-    """
-    Core epoch/batch loop extracted so both manual and sweep modes share it.
-    Returns (preempted, best_val_acc, avg_val_loss).
-    """
+    """Core epoch/batch loop. Returns (preempted, best_val_acc, avg_val_loss)."""
     autocast     = get_autocast_context(precision, device)
     best_val_acc = 0.0
     avg_val_loss = 999.0
@@ -730,30 +740,16 @@ def _run_training_loop(cfg: dict, model: nn.Module, optimizer, criterion,
 # ══════════════════════════════════════════════════════════════════
 
 def _apply_paradigm(cfg: dict, paradigm: str):
-    """
-    Mutate cfg in-place based on training paradigm.
-    Called once before model build — effects persist through training loop.
-
-    fine-tuning  → no change (defaults are tuned for this)
-    pre-training → larger ckpt_every (less frequent saves, longer runs),
-                   gradient clipping added via cfg flag
-    rl           → aggressive ckpt_every (reward is noisy, preemption
-                   mid-episode is costly), lower LR
-    distillation → moderate ckpt_every, higher dropout tolerance
-    """
+    """Mutate cfg in-place based on training paradigm."""
     if paradigm == "rl":
-        # RL jobs: checkpoint very aggressively — losing an episode is expensive
         original = cfg["ckpt_every"]
         cfg["ckpt_every"] = max(10, original // 5)
-        # RL typically needs lower LR for stable policy updates
         cfg["lr"] = float(cfg["lr"]) * 0.1
-        cfg["_grad_clip"] = 1.0    # gradient clipping for policy stability
+        cfg["_grad_clip"] = 1.0
         print(f"[paradigm] RL — ckpt_every {original}→{cfg['ckpt_every']}  "
               f"lr→{cfg['lr']:.5f}  grad_clip=1.0")
 
     elif paradigm == "pre-training":
-        # Pre-training: longer runs, checkpoint less often to reduce overhead
-        # but clip gradients to prevent divergence on large models
         original = cfg["ckpt_every"]
         cfg["ckpt_every"] = original * 2
         cfg["_grad_clip"] = 5.0
@@ -761,13 +757,12 @@ def _apply_paradigm(cfg: dict, paradigm: str):
               f"grad_clip=5.0")
 
     elif paradigm == "distillation":
-        # Distillation: converges faster, moderate checkpointing
         original = cfg["ckpt_every"]
         cfg["ckpt_every"] = max(20, original // 2)
         cfg["_grad_clip"] = None
         print(f"[paradigm] Distillation — ckpt_every {original}→{cfg['ckpt_every']}")
 
-    else:  # fine-tuning (default)
+    else:
         cfg["_grad_clip"] = None
         print(f"[paradigm] Fine-tuning — ckpt_every={cfg['ckpt_every']} (unchanged)")
 
@@ -791,6 +786,7 @@ def train(cfg: dict):
     print(f"  cloud      : {os.environ.get('CLOUD','gcp')} / "
           f"{os.environ.get('INSTANCE_TYPE','e2-standard-4')}")
     print(f"  budget     : ${cfg['max_budget']}  price=${cfg['price_usd_hr']}/hr")
+    print(f"  RESUME_STEP: {os.environ.get('RESUME_STEP','0')}")
     print("="*60 + "\n")
 
     start_time = time.time()
@@ -807,14 +803,12 @@ def train(cfg: dict):
               f"hidden={cfg['sweep_hidden']}  trials={cfg['sweep_trials']}")
 
         best_cfg = run_hyperband(cfg, train_loader, val_loader, device)
-
-        # Update cfg with best hyperparams found, train full epochs
         cfg["lr"]         = best_cfg["lr"]
         cfg["hidden_dim"] = best_cfg["hidden_dim"]
         print(f"\n[sweep] Final training with best config: "
               f"lr={cfg['lr']}  hidden_dim={cfg['hidden_dim']}")
 
-    # ── TRAINING PARADIGM — override ckpt_every + optimizer ──────
+    # ── TRAINING PARADIGM ─────────────────────────────────────────
     paradigm = cfg.get("training_paradigm", "fine-tuning").lower()
     _apply_paradigm(cfg, paradigm)
 
@@ -870,7 +864,6 @@ def train(cfg: dict):
         print(f"  Time:  {stats['elapsed_hrs']*60:.1f} min  Cost: ${stats['cost_usd']:.4f}")
         print(f"{'='*60}\n")
 
-        # int8 post-training quantization
         if precision == "int8":
             model_fp32 = model.cpu().float()
             model_q    = torch.quantization.quantize_dynamic(

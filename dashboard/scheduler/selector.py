@@ -1,12 +1,12 @@
 """
 scheduler/selector.py
 ──────────────────────────────────────────────────────────────────────
-Multi-cloud Pareto optimizer — replaces Phase 1 GCP-only stub.
+Multi-cloud Pareto optimizer.
 
 Algorithm
 ─────────
 1. Fetch live candidates from GCP + AWS + Azure providers.
-2. Filter by preferred_clouds and spot_only (new — from modal).
+2. Filter by preferred_clouds and spot_only.
 3. Estimate total runtime and total cost per candidate.
 4. Apply hard constraints:
    • Reject if price_usd_hr * est_hours > max_budget
@@ -33,10 +33,6 @@ import os
 import logging
 import math
 from typing import Optional
-from api.server import get_bq_client   # or wherever you put it
-from risk.predictor import score_instance_from_api
-
-bq = get_bq_client()
 
 logger = logging.getLogger(__name__)
 
@@ -44,54 +40,49 @@ logger = logging.getLogger(__name__)
 GCS_BUCKET = os.getenv("CHECKPOINT_GCS_BUCKET", "")
 
 # ── Base scoring weights (sum to 1.0) ────────────────────────────
-# Adjusted dynamically by priority and carbon_aware.
-# Carbon gets a share carved out of cost weight when enabled.
 W_COST   = float(os.getenv("SELECTOR_W_COST",   "0.40"))
 W_RISK   = float(os.getenv("SELECTOR_W_RISK",   "0.35"))
 W_TIME   = float(os.getenv("SELECTOR_W_TIME",   "0.25"))
-W_CARBON = float(os.getenv("SELECTOR_W_CARBON", "0.00"))  # 0 unless carbon_aware
+W_CARBON = float(os.getenv("SELECTOR_W_CARBON", "0.00"))
 
 # ── Carbon intensity by region (gCO2eq/kWh) ──────────────────────
-# Source: GCP + Azure carbon data, AWS estimated from EPA eGRID.
-# Lower = cleaner. Used only when carbon_aware=True.
-# Regions not listed get a neutral default (400).
 CARBON_INTENSITY: dict[str, float] = {
     # GCP
-    "us-central1":         494,   # Iowa — mostly coal/gas
-    "us-east1":            545,   # S. Carolina
-    "us-east4":            383,   # N. Virginia
-    "us-west1":             83,   # Oregon — very clean (hydro/wind)
-    "us-west2":            195,   # Los Angeles
-    "us-west3":            536,   # Salt Lake City
-    "us-west4":            490,   # Las Vegas
-    "europe-west1":         94,   # Belgium
-    "europe-west4":        283,   # Netherlands
-    "europe-north1":        26,   # Finland — very clean
-    "asia-east1":          541,   # Taiwan
-    "asia-southeast1":     453,   # Singapore
+    "us-central1":    494,
+    "us-east1":       545,
+    "us-east4":       383,
+    "us-west1":        83,
+    "us-west2":       195,
+    "us-west3":       536,
+    "us-west4":       490,
+    "europe-west1":    94,
+    "europe-west4":   283,
+    "europe-north1":   26,
+    "asia-east1":     541,
+    "asia-southeast1":453,
     # AWS
-    "us-east-1":           415,   # N. Virginia
-    "us-east-2":           439,   # Ohio
-    "us-west-1":           207,   # N. California
-    "us-west-2":            82,   # Oregon — very clean
-    "eu-west-1":           316,   # Ireland
-    "eu-central-1":        338,   # Frankfurt
-    "eu-north-1":           8,    # Stockholm — cleanest
-    "ap-southeast-1":      453,   # Singapore
-    "ap-northeast-1":      506,   # Tokyo
+    "us-east-1":      415,
+    "us-east-2":      439,
+    "us-west-1":      207,
+    "us-west-2":       82,
+    "eu-west-1":      316,
+    "eu-central-1":   338,
+    "eu-north-1":       8,
+    "ap-southeast-1": 453,
+    "ap-northeast-1": 506,
     # Azure
-    "eastus":              383,
-    "eastus2":             383,
-    "westus":              207,
-    "westus2":              82,   # Oregon — very clean
-    "westus3":             536,
-    "northeurope":         316,   # Ireland
-    "westeurope":          283,   # Netherlands
-    "swedencentral":        8,    # Stockholm — cleanest
-    "southeastasia":       453,
-    "japaneast":           506,
+    "eastus":         383,
+    "eastus2":        383,
+    "westus":         207,
+    "westus2":         82,
+    "westus3":        536,
+    "northeurope":    316,
+    "westeurope":     283,
+    "swedencentral":    8,
+    "southeastasia":  453,
+    "japaneast":      506,
 }
-_CARBON_DEFAULT = 400.0  # neutral fallback for unknown regions
+_CARBON_DEFAULT = 400.0
 
 
 def _carbon_for(region: str) -> float:
@@ -106,7 +97,7 @@ _GPU_THROUGHPUT = {
     "L4":   20_000,
     "K80":   8_000,
     "M60":   6_000,
-    None:    3_000,   # CPU-only
+    None:    3_000,
 }
 
 
@@ -162,20 +153,6 @@ def _validate_env() -> list[str]:
 
 # ── Priority → weight mapping ─────────────────────────────────────
 def _priority_weights(priority: str, carbon_aware: bool, carbon_weight: str) -> tuple[float, float, float, float]:
-    """
-    Return (w_cost, w_risk, w_time, w_carbon) based on job priority
-    and carbon settings.
-
-    priority:
-        cheapest  → maximize cost reduction, accept more time
-        balanced  → Pareto optimal (default)
-        fastest   → minimize time, accept higher cost
-
-    carbon_weight (only when carbon_aware=True):
-        light    → carbon gets 0.10 share carved from cost
-        balanced → carbon gets 0.20 share carved from cost
-        strong   → carbon gets 0.30 share carved from cost
-    """
     base = {
         "cheapest": (0.60, 0.25, 0.15),
         "balanced": (0.40, 0.35, 0.25),
@@ -189,7 +166,6 @@ def _priority_weights(priority: str, carbon_aware: bool, carbon_weight: str) -> 
 
     carbon_shares = {"light": 0.10, "balanced": 0.20, "strong": 0.30}
     w_carbon = carbon_shares.get(carbon_weight, 0.20)
-    # Carve carbon share proportionally from cost and time
     w_cost = round(w_cost - w_carbon * 0.6, 4)
     w_time = round(w_time - w_carbon * 0.4, 4)
     w_cost = max(w_cost, 0.05)
@@ -198,11 +174,7 @@ def _priority_weights(priority: str, carbon_aware: bool, carbon_weight: str) -> 
 
 
 def _pareto_frontier(candidates: list[dict], carbon_aware: bool = False) -> list[dict]:
-    """
-    Return Pareto-non-dominated subset.
-    3-objective normally: cost, risk, time.
-    4-objective when carbon_aware: cost, risk, time, carbon.
-    """
+    """Return Pareto-non-dominated subset (3- or 4-objective)."""
     pareto = []
     for i, a in enumerate(candidates):
         dominated = False
@@ -248,11 +220,7 @@ def _weighted_score(
     w_carbon: float,
     preferred_regions: list[str],
 ) -> dict:
-    """
-    Pick best candidate by weighted score.
-    preferred_regions applies a 0.05 bonus (score reduction) for matching regions.
-    Lower score = better.
-    """
+    """Pick best candidate by weighted score. Lower = better."""
     costs   = [c["est_cost"]        for c in candidates]
     risks   = [c["preemption_risk"] for c in candidates]
     times   = [c["est_hours"]       for c in candidates]
@@ -273,7 +241,6 @@ def _weighted_score(
             w_time   * norm_times[i]   +
             w_carbon * norm_carbons[i]
         )
-        # Preferred region soft bonus — reduces score by 0.05
         if preferred_regions and c.get("region") in preferred_regions:
             score -= 0.05
 
@@ -300,25 +267,12 @@ def _apply_constraints(
     gpu_required: bool,
     spot_only: bool,
 ) -> tuple[list[dict], list[dict]]:
-    """
-    Split candidates into (valid, rejected).
-
-    Hard constraints:
-    - budget: est_cost <= max_budget
-    - deadline: est_hours <= deadline_hrs
-    - gpu_required: gpu_mem_gb >= min_gpu_mem (only when gpu_required=True)
-    - spot_only: instance must be a spot/preemptible instance
-
-    NEW vs old selector:
-    - gpu_required flag added (old code only checked min_gpu_mem > 0)
-    - spot_only filter added
-    """
+    """Split candidates into (valid, rejected)."""
     valid    = []
     rejected = []
 
     for c in candidates:
         reasons = []
-
         if c["est_cost"] > max_budget:
             reasons.append(
                 f"budget exceeded (${c['est_cost']:.2f} > ${max_budget:.2f})"
@@ -331,8 +285,6 @@ def _apply_constraints(
             reasons.append(
                 f"insufficient GPU memory ({c.get('gpu_mem_gb',0)}GB < {min_gpu_mem}GB)"
             )
-        # spot_only: providers tag spot instances with is_spot=True
-        # If the provider doesn't set is_spot, we treat it as spot (benefit of doubt)
         if spot_only and c.get("is_spot") is False:
             reasons.append("on-demand instance rejected (spot_only=True)")
 
@@ -349,15 +301,9 @@ def _filter_preferred_clouds(
     candidates: list[dict],
     preferred_clouds: list[str],
 ) -> list[dict]:
-    """
-    Hard-filter candidates to only preferred clouds.
-    If preferred_clouds is empty or ['aws','gcp','azure'] (all), returns all.
-    Falls back to all candidates if filtering would leave nothing.
-
-    NEW — was not in old selector at all.
-    """
+    """Hard-filter candidates to only preferred clouds. Falls back if nothing matches."""
     if not preferred_clouds or set(preferred_clouds) >= {"aws", "gcp", "azure"}:
-        return candidates   # no restriction
+        return candidates
 
     filtered = [c for c in candidates if c.get("cloud", "").lower() in preferred_clouds]
 
@@ -366,7 +312,7 @@ def _filter_preferred_clouds(
             f"[Selector] preferred_clouds={preferred_clouds} filtered out ALL candidates "
             f"— falling back to unrestricted pool."
         )
-        return candidates   # safe fallback
+        return candidates
 
     logger.info(
         f"[Selector] preferred_clouds filter: "
@@ -377,10 +323,6 @@ def _filter_preferred_clouds(
 
 
 def _parse_preferred_regions(region_str: str) -> list[str]:
-    """
-    Parse comma-separated region string from modal into a list.
-    e.g. "us-east-1, us-central1" → ["us-east-1", "us-central1"]
-    """
     if not region_str:
         return []
     return [r.strip() for r in region_str.split(",") if r.strip()]
@@ -390,16 +332,15 @@ def pick_best_cloud(job: dict) -> dict:
     """
     Main entry point. Given a job spec, return the best cloud + instance.
 
-    New fields consumed (from updated modal + server.py):
+    Fields consumed:
         preferred_clouds   list[str]  e.g. ["aws", "gcp"]
         preferred_regions  str        comma-separated e.g. "us-east-1, us-west-2"
         gpu_required       bool       hard filter — must have GPU
         spot_only          bool       hard filter — spot/preemptible only
-        ondemand_max_hrs   float      stored in config, consumed by poller (not here)
+        ondemand_max_hrs   float      stored in config, consumed by poller
         carbon_aware       bool       enables 4th Pareto axis + weight
         carbon_weight      str        "light" | "balanced" | "strong"
         priority           str        "cheapest" | "balanced" | "fastest"
-                                      → drives weight vector
     """
     env_warnings = _validate_env()
     if env_warnings:
@@ -416,10 +357,9 @@ def pick_best_cloud(job: dict) -> dict:
     carbon_aware      = bool(job.get("carbon_aware",   False))
     carbon_weight     = job.get("carbon_weight",      "balanced")
     priority          = job.get("priority",           "balanced")
-
-    # Legacy field — still respected if present
-    prefer_cloud = job.get("prefer_cloud", "any").lower()
-
+    prefer_cloud      = job.get("prefer_cloud", "any").lower()
+    print("called selector")
+    print(job)
     logger.info(
         f"[Selector] pick_best_cloud — job={job_id}  "
         f"budget=${max_budget}  deadline={deadline_hrs}h  "
@@ -429,7 +369,7 @@ def pick_best_cloud(job: dict) -> dict:
         f"carbon_aware={carbon_aware}({carbon_weight})  priority={priority}"
     )
 
-    # ── 1. Collect candidates from all providers ──────────────────
+    # ── 1. Collect candidates ─────────────────────────────────────
     all_candidates: list[dict] = []
     provider_errors: list[str] = []
 
@@ -448,23 +388,20 @@ def pick_best_cloud(job: dict) -> dict:
     from scheduler.providers.aws_provider   import list_instances as aws_list
     from scheduler.providers.azure_provider import list_instances as azure_list
 
-    # Respect both preferred_clouds and legacy prefer_cloud
     fetch_clouds = set(preferred_clouds) if preferred_clouds else {"gcp", "aws", "azure"}
     if prefer_cloud != "any":
-        fetch_clouds = {prefer_cloud}   # legacy override wins
+        fetch_clouds = {prefer_cloud}
 
     if "gcp"   in fetch_clouds: all_candidates += _safe_list(gcp_list,   "GCP")
     if "aws"   in fetch_clouds: all_candidates += _safe_list(aws_list,   "AWS")
     if "azure" in fetch_clouds: all_candidates += _safe_list(azure_list, "Azure")
-
+    print(_safe_list)
     if not all_candidates:
         logger.error("[Selector] All providers failed — using emergency GCP fallback")
         return _emergency_fallback(job, max_budget, deadline_hrs,
                                    reason="all providers unreachable")
 
-    # ── 2. Filter by preferred_clouds (hard filter) ───────────────
-    # This is a secondary filter in case providers returned extra clouds.
-    # Primary filtering is done at fetch time above, but this catches edge cases.
+    # ── 2. Filter by preferred_clouds ────────────────────────────
     all_candidates = _filter_preferred_clouds(all_candidates, list(fetch_clouds))
 
     # ── 3. Enrich with est hours, cost, carbon intensity ─────────
@@ -472,7 +409,11 @@ def pick_best_cloud(job: dict) -> dict:
         c["est_hours"]        = _estimate_training_hours(c, job)
         c["est_cost"]         = round(c["price_usd_hr"] * c["est_hours"], 4)
         c["carbon_intensity"] = _carbon_for(c.get("region", ""))
-    
+
+    # Risk scoring via live predictor
+    from api.server import get_bq_client
+    from risk.predictor import score_instance_from_api
+    bq = get_bq_client()
     for c in all_candidates:
         try:
             c["preemption_risk"] = score_instance_from_api(
@@ -532,7 +473,7 @@ def pick_best_cloud(job: dict) -> dict:
             return _emergency_fallback(job, max_budget, deadline_hrs,
                                        reason="no instances after constraint relaxation")
 
-    # ── 6. Pareto frontier (3 or 4 objectives) ────────────────────
+    # ── 6. Pareto frontier ────────────────────────────────────────
     pareto = _pareto_frontier(valid, carbon_aware=carbon_aware)
     logger.info(
         f"[Selector] Pareto frontier: {len(pareto)} non-dominated "
@@ -547,7 +488,7 @@ def pick_best_cloud(job: dict) -> dict:
             f"gpu={p.get('gpu_model','CPU')}"
         )
 
-    # ── 7. Dynamic weights from priority + carbon settings ────────
+    # ── 7. Dynamic weights ────────────────────────────────────────
     w_cost, w_risk, w_time, w_carbon = _priority_weights(
         priority, carbon_aware, carbon_weight
     )
@@ -557,7 +498,7 @@ def pick_best_cloud(job: dict) -> dict:
         f"(priority={priority}, carbon_aware={carbon_aware})"
     )
 
-    # ── 8. Weighted scoring with region bias ──────────────────────
+    # ── 8. Weighted scoring ───────────────────────────────────────
     winner = _weighted_score(
         pareto, w_cost, w_risk, w_time, w_carbon, preferred_regions
     )
@@ -583,7 +524,8 @@ def pick_best_cloud(job: dict) -> dict:
 
     logger.info(f"[Selector] ✓ Winner: [{winner['cloud']}] {winner['instance_type']}")
     logger.info(f"[Selector]   {reason}")
-
+    print("winner")
+    print(winner)
     # ── 9. Build decision dict ────────────────────────────────────
     return {
         "cloud":            winner["cloud"],
@@ -614,7 +556,8 @@ def pick_best_cloud(job: dict) -> dict:
 
 
 def _emergency_fallback(job: dict, max_budget: float, deadline_hrs: float,
-                         reason: str = "") -> dict:
+                        reason: str = "") -> dict:
+    """Last-resort fallback: GCP e2-standard-4 spot (CPU)."""
     logger.error(f"[Selector] EMERGENCY FALLBACK triggered: {reason}")
     PRICE     = 0.034
     est_hours = min(max_budget / PRICE, deadline_hrs)
@@ -648,49 +591,28 @@ if __name__ == "__main__":
     import json
     logging.basicConfig(level=logging.INFO)
 
-    # Test 1 — GPU job, AWS+GCP only, carbon-aware
     test_job = {
-        "job_id":           "test-001",
-        "max_budget":       5.0,
-        "deadline_hrs":     8.0,
-        "min_gpu_mem":      16.0,
-        "gpu_required":     True,
-        "spot_only":        True,
-        "preferred_clouds": ["aws", "gcp"],
+        "job_id":            "test-001",
+        "max_budget":        5.0,
+        "deadline_hrs":      8.0,
+        "min_gpu_mem":       16.0,
+        "gpu_required":      True,
+        "spot_only":         True,
+        "preferred_clouds":  ["aws", "gcp"],
         "preferred_regions": "us-west-2, us-west1",
-        "carbon_aware":     True,
-        "carbon_weight":    "balanced",
-        "priority":         "balanced",
-        "dataset_size_mb":  2048,
-        "num_epochs":       20,
-        "batch_size":       64,
+        "carbon_aware":      True,
+        "carbon_weight":     "balanced",
+        "priority":          "balanced",
+        "dataset_size_mb":   2048,
+        "num_epochs":        20,
+        "batch_size":        64,
     }
 
-    # Test 2 — CPU job, cheapest priority, any cloud
-    test_job_2 = {
-        "job_id":           "test-002",
-        "max_budget":       2.0,
-        "deadline_hrs":     6.0,
-        "min_gpu_mem":      0.0,
-        "gpu_required":     False,
-        "spot_only":        True,
-        "preferred_clouds": ["aws", "gcp", "azure"],
-        "preferred_regions": "",
-        "carbon_aware":     False,
-        "priority":         "cheapest",
-        "synthetic_rows":   500000,
-        "num_epochs":       50,
-        "batch_size":       64,
-    }
-
-    for tj in [test_job, test_job_2]:
-        print(f"\n{'='*60}")
-        print(f"Testing job: {tj['job_id']}")
-        result = pick_best_cloud(tj)
-        display = {k: v for k, v in result.items() if k != "pareto_set"}
-        print(json.dumps(display, indent=2))
-        print(f"\nPareto set ({len(result['pareto_set'])} candidates):")
-        for p in result["pareto_set"]:
-            print(f"  [{p['cloud']:5}] {p['instance_type']:25} "
-                  f"${p['est_cost']:.2f}  risk={p['preemption_risk']:.2f}  "
-                  f"carbon={p.get('carbon_intensity','?')}")
+    result = pick_best_cloud(test_job)
+    display = {k: v for k, v in result.items() if k != "pareto_set"}
+    print(json.dumps(display, indent=2))
+    print(f"\nPareto set ({len(result['pareto_set'])} candidates):")
+    for p in result["pareto_set"]:
+        print(f"  [{p['cloud']:5}] {p['instance_type']:25} "
+              f"${p['est_cost']:.2f}  risk={p['preemption_risk']:.2f}  "
+              f"carbon={p.get('carbon_intensity','?')}")

@@ -183,11 +183,10 @@ def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["spot_ratio"]   = df["price_usd_per_hr"] / df["ondemand_price_usd_hr"].replace(0, eps)
     mean_price = df["price_usd_per_hr"].mean()
     if mean_price == 0:
-            mean_price = eps
-
+        mean_price = eps
     df["price_vs_mean"] = df["price_usd_per_hr"] / mean_price
 
-    # ── Sort (prepare_data groups by cloud/region/az) ──────────────
+    # ── Sort ───────────────────────────────────────────────────────
     df = df.sort_values("collected_at").reset_index(drop=True)
 
     # ── Lag features ───────────────────────────────────────────────
@@ -211,7 +210,6 @@ def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         p = df["preempted"].astype(float)
         df["recent_preempt_rate_5"]  = p.rolling(5,  min_periods=1).mean()
         df["recent_preempt_rate_10"] = p.rolling(10, min_periods=1).mean()
-        # Consecutive preemption streak
         df["preempt_streak"] = p.groupby(
             (p != p.shift()).cumsum()
         ).cumcount().where(p == 1, 0)
@@ -225,7 +223,7 @@ def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     cat_map = {
         "cloud":             "cloud_enc",
         "region":            "region_enc",
-        "availability_zone": "zone_enc",        # ← zone_enc not availability_zone_enc
+        "availability_zone": "zone_enc",
         "instance_type":     "instance_type_enc",
         "gpu_class":         "gpu_class_enc",
     }
@@ -251,7 +249,7 @@ def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════
 
 def _fetch_rows(cloud, region, az, instance_type, bq_client) -> pd.DataFrame:
-    """Fetch raw rows from BigQuery — only columns that exist in the table."""
+    """Fetch raw rows from BigQuery."""
     from google.cloud.bigquery import QueryJobConfig, ScalarQueryParameter
 
     PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "tensile-method-459009-k2")
@@ -304,10 +302,8 @@ def score_instance(cloud, region, az, instance_type, bq_client) -> float:
         print(f"[risk]   Not enough rows → returning 0.5")
         return 0.5
 
-    # Feature engineering
     df = _engineer_features(df_raw)
 
-    # Validate all features present
     missing = [c for c in _feat_cols if c not in df.columns]
     if missing:
         raise ValueError(
@@ -315,28 +311,25 @@ def score_instance(cloud, region, az, instance_type, bq_client) -> float:
             f"Add to _engineer_features() to match prepare_data.py"
         )
 
-    # Build arrays
     X_raw  = df[list(_feat_cols)].values.astype(np.float32)
     X_sc   = _scaler.transform(X_raw)
-    X_seq  = X_sc[-SEQUENCE_LEN:]   # (60, 29) — sequence for LSTM
-    X_flat = X_sc[-1]               # (29,)    — latest row for XGBoost
+    X_seq  = X_sc[-SEQUENCE_LEN:]
+    X_flat = X_sc[-1]
 
     print(f"[risk]   X_seq: {X_seq.shape}  price_last={df['price_usd_per_hr'].iloc[-1]:.4f}")
     print(f"[risk]   spot_ratio={df['spot_ratio'].iloc[-1]:.4f}  "
           f"preempt_rate_5={df['recent_preempt_rate_5'].iloc[-1]:.4f}")
 
-    # LSTM → temporal features
-    seq_t = torch.tensor(X_seq).unsqueeze(0)   # (1, 60, 29)
+    seq_t = torch.tensor(X_seq).unsqueeze(0)
     with torch.no_grad():
         lstm_feats, lstm_logit = _lstm(seq_t)
-    lstm_feats = lstm_feats.squeeze(0).numpy()  # (8,)
+    lstm_feats = lstm_feats.squeeze(0).numpy()
     print(f"[risk]   LSTM logit={lstm_logit.item():.4f}  "
           f"feats={lstm_feats.round(3).tolist()}")
 
-    # XGBoost regression → risk score directly (no predict_proba)
-    X_hybrid = np.hstack([lstm_feats, X_flat]).reshape(1, -1)  # (1, 37)
+    X_hybrid = np.hstack([lstm_feats, X_flat]).reshape(1, -1)
     risk     = float(_xgb.predict(X_hybrid)[0])
-    risk     = float(np.clip(risk, 0.0, 1.0))   # safety clip
+    risk     = float(np.clip(risk, 0.0, 1.0))
     print(f"[risk]   RISK SCORE = {risk:.4f}")
 
     return round(risk, 4)
@@ -344,7 +337,6 @@ def score_instance(cloud, region, az, instance_type, bq_client) -> float:
 
 def score_all_instances(bq_client) -> list[dict]:
     """Score every distinct active instance. Returns list sorted by risk desc."""
-    
     PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "tensile-method-459009-k2")
     DATASET    = os.getenv("BIGQUERY_DATASET", "spot_prices")
     TABLE      = os.getenv("BIGQUERY_TABLE",   "price_history")
@@ -359,23 +351,11 @@ def score_all_instances(bq_client) -> list[dict]:
 
     print("\n[risk] Running instance discovery query...")
     instances = list(bq_client.query(query))
-
     print(f"[risk] Found {len(instances)} instances")
 
-    for i, row in enumerate(instances, 1):
-        print(f"[risk] Instance {i}: {dict(row)}")
-
     results = []
-
     for i, row in enumerate(instances, 1):
         try:
-            print("\n" + "="*60)
-            print(f"[risk] START SCORING #{i}")
-            print(f"[risk] cloud         = {row['cloud']}")
-            print(f"[risk] region        = {row['region']}")
-            print(f"[risk] az            = {row['availability_zone']}")
-            print(f"[risk] instance_type = {row['instance_type']}")
-
             score = score_instance(
                 cloud=row["cloud"],
                 region=row["region"],
@@ -383,37 +363,23 @@ def score_all_instances(bq_client) -> list[dict]:
                 instance_type=row["instance_type"],
                 bq_client=bq_client,
             )
-
-            print(f"[risk] FINAL SCORE = {score}")
-
             results.append({
-                "cloud": row["cloud"],
-                "region": row["region"],
-                "az": row["availability_zone"],
+                "cloud":         row["cloud"],
+                "region":        row["region"],
+                "az":            row["availability_zone"],
                 "instance_type": row["instance_type"],
-                "risk_score": score,
+                "risk_score":    score,
             })
-
         except Exception as e:
             print(f"[risk] ERROR: {type(e).__name__}: {e}")
 
     results.sort(key=lambda x: x["risk_score"], reverse=True)
-
-    print("\n[risk] FINAL SORTED RESULTS")
-    for r in results:
-        print(r)
-
     return results
 
 
-
-
 def _fetch_live_prices(cloud: str, region: str, az: str,
-                        instance_type: str) -> pd.DataFrame:
-    """
-    Fetch live spot price history from cloud APIs.
-    Returns a DataFrame with the same columns as BigQuery would.
-    """
+                       instance_type: str) -> pd.DataFrame:
+    """Fetch live spot price history from cloud APIs."""
     rows = []
 
     if cloud == "aws":
@@ -426,28 +392,24 @@ def _fetch_live_prices(cloud: str, region: str, az: str,
             zones_resp = ec2.describe_availability_zones(
                 Filters=[{"Name": "region-name", "Values": [region]}]
             )
-
             zones = [
                 z["ZoneName"]
                 for z in zones_resp["AvailabilityZones"]
                 if z["State"] == "available"
             ]
-
             az = zones[0] if zones else None
             print(f"[risk]   Auto-selected AZ: {az}")
 
         params = {
-            "InstanceTypes": [instance_type],
+            "InstanceTypes":       [instance_type],
             "ProductDescriptions": ["Linux/UNIX"],
-            "StartTime": datetime.now(timezone.utc) - timedelta(hours=1080),#45 days
-            "MaxResults": 100,
+            "StartTime":           datetime.now(timezone.utc) - timedelta(hours=1080),
+            "MaxResults":          100,
         }
-
         if az:
             params["AvailabilityZone"] = az
 
         resp = ec2.describe_spot_price_history(**params)
-
         print(f"[risk]   Retrieved {len(resp.get('SpotPriceHistory', []))} spot records")
 
         for entry in resp.get("SpotPriceHistory", []):
@@ -466,10 +428,7 @@ def _fetch_live_prices(cloud: str, region: str, az: str,
                 "collected_at":          entry["Timestamp"],
             })
 
-
     elif cloud == "gcp":
-        # GCP preemptible prices are quasi-static — generate synthetic history
-        # from the known price with small noise to fill the sequence
         import random
         base_price = _get_gcp_preemptible_price(instance_type, region)
         now        = pd.Timestamp.now(tz="UTC")
@@ -491,7 +450,6 @@ def _fetch_live_prices(cloud: str, region: str, az: str,
             })
 
     elif cloud == "azure":
-        # Azure spot prices via REST API
         price = _get_azure_spot_price(instance_type, region)
         now   = pd.Timestamp.now(tz="UTC")
         for i in range(SEQUENCE_LEN + 10):
@@ -520,7 +478,6 @@ def _fetch_live_prices(cloud: str, region: str, az: str,
 
 
 def _get_aws_ondemand(instance_type: str) -> float:
-    """Approximate on-demand prices for discount ratio calculation."""
     prices = {
         "t3.small":     0.0208,
         "t3.medium":    0.0416,
@@ -533,7 +490,6 @@ def _get_aws_ondemand(instance_type: str) -> float:
 
 
 def _get_gcp_preemptible_price(instance_type: str, region: str) -> float:
-    """GCP preemptible prices (quasi-static)."""
     prices = {
         "e2-standard-4":  0.067,
         "g2-standard-4":  0.2818,
@@ -544,10 +500,6 @@ def _get_gcp_preemptible_price(instance_type: str, region: str) -> float:
 
 
 def _get_azure_spot_price(instance_type: str, region: str) -> float:
-    """
-    Fetch Azure spot price from Retail Prices API.
-    Falls back to approximate if API fails.
-    """
     try:
         import requests
         url    = "https://prices.azure.com/api/retail/prices"
@@ -565,7 +517,6 @@ def _get_azure_spot_price(instance_type: str, region: str) -> float:
             return float(items[0]["retailPrice"])
     except Exception:
         pass
-    # Fallback approximations
     fallbacks = {
         "Standard_NC4as_T4_v3": 0.21,
         "Standard_NC8as_T4_v3": 0.36,
@@ -573,63 +524,9 @@ def _get_azure_spot_price(instance_type: str, region: str) -> float:
     return fallbacks.get(instance_type, 0.15)
 
 
-def score_instance_from_api(
-    cloud:         str,
-    region:        str,
-    az:            str,
-    instance_type: str,
-    bq_client=None,       # ← add this
-) -> float:
-    import torch
-
-    load_models()
-
-    print(f"[risk]   Fetching live prices: {cloud}/{instance_type}/{region}")
-    df_raw = _fetch_live_prices(cloud, region, az, instance_type)
-
-    # ── Fallback to BQ if live API didn't return enough ───────────
-    if (df_raw.empty or len(df_raw) < SEQUENCE_LEN) and bq_client is not None:
-        print(f"[risk]   Live API only returned {len(df_raw)} rows — "
-              f"falling back to BQ historical data")
-        df_bq = _fetch_bq_fallback(cloud, region, az, instance_type, bq_client)
-
-        if not df_raw.empty:
-            # Merge: BQ history as base, live rows on top (most recent wins)
-            df_raw = pd.concat([df_bq, df_raw], ignore_index=True)
-            df_raw = df_raw.sort_values("collected_at").drop_duplicates(
-                subset=["collected_at"], keep="last"
-            ).reset_index(drop=True)
-        else:
-            df_raw = df_bq
-
-    if df_raw.empty or len(df_raw) < SEQUENCE_LEN:
-        print(f"[risk]   Still not enough data ({len(df_raw)}) → returning 0.5")
-        return 0.5
-
-    df = _engineer_features(df_raw)
-
-    X_raw  = df[list(_feat_cols)].values.astype(np.float32)
-    X_sc   = _scaler.transform(X_raw)
-    X_seq  = X_sc[-SEQUENCE_LEN:]
-    X_flat = X_sc[-1]
-
-    seq_t = torch.tensor(X_seq).unsqueeze(0)
-    with torch.no_grad():
-        lstm_feats, lstm_logit = _lstm(seq_t)
-    lstm_feats = lstm_feats.squeeze(0).numpy()
-
-    X_hybrid = np.hstack([lstm_feats, X_flat]).reshape(1, -1)
-    risk     = float(np.clip(_xgb.predict(X_hybrid)[0], 0.0, 1.0))
-
-    print(f"[risk]   LSTM logit={lstm_logit.item():.4f}  risk={risk:.4f}")
-    return round(risk, 4)
-
 def _fetch_bq_fallback(cloud: str, region: str, az: str,
-                        instance_type: str, bq_client) -> pd.DataFrame:
-    """
-    Fallback: fetch historical rows for same instance/region across
-    past 7 days when live API doesn't return enough data.
-    """
+                       instance_type: str, bq_client) -> pd.DataFrame:
+    """Fallback: fetch historical rows from BQ when live API doesn't return enough data."""
     from google.cloud.bigquery import QueryJobConfig, ScalarQueryParameter
 
     PROJECT_ID = os.getenv("GCP_PROJECT_ID",  "tensile-method-459009-k2")
@@ -663,3 +560,53 @@ def _fetch_bq_fallback(cloud: str, region: str, az: str,
     df = pd.DataFrame([dict(r) for r in rows])
     print(f"[risk]   BQ fallback rows: {len(df)}")
     return df
+
+
+def score_instance_from_api(
+    cloud:         str,
+    region:        str,
+    az:            str,
+    instance_type: str,
+    bq_client=None,
+) -> float:
+    import torch
+
+    load_models()
+
+    print(f"[risk]   Fetching live prices: {cloud}/{instance_type}/{region}")
+    df_raw = _fetch_live_prices(cloud, region, az, instance_type)
+
+    if (df_raw.empty or len(df_raw) < SEQUENCE_LEN) and bq_client is not None:
+        print(f"[risk]   Live API only returned {len(df_raw)} rows — "
+              f"falling back to BQ historical data")
+        df_bq = _fetch_bq_fallback(cloud, region, az, instance_type, bq_client)
+
+        if not df_raw.empty:
+            df_raw = pd.concat([df_bq, df_raw], ignore_index=True)
+            df_raw = df_raw.sort_values("collected_at").drop_duplicates(
+                subset=["collected_at"], keep="last"
+            ).reset_index(drop=True)
+        else:
+            df_raw = df_bq
+
+    if df_raw.empty or len(df_raw) < SEQUENCE_LEN:
+        print(f"[risk]   Still not enough data ({len(df_raw)}) → returning 0.5")
+        return 0.5
+
+    df = _engineer_features(df_raw)
+
+    X_raw  = df[list(_feat_cols)].values.astype(np.float32)
+    X_sc   = _scaler.transform(X_raw)
+    X_seq  = X_sc[-SEQUENCE_LEN:]
+    X_flat = X_sc[-1]
+
+    seq_t = torch.tensor(X_seq).unsqueeze(0)
+    with torch.no_grad():
+        lstm_feats, lstm_logit = _lstm(seq_t)
+    lstm_feats = lstm_feats.squeeze(0).numpy()
+
+    X_hybrid = np.hstack([lstm_feats, X_flat]).reshape(1, -1)
+    risk     = float(np.clip(_xgb.predict(X_hybrid)[0], 0.0, 1.0))
+
+    print(f"[risk]   LSTM logit={lstm_logit.item():.4f}  risk={risk:.4f}")
+    return round(risk, 4)

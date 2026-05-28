@@ -1,33 +1,31 @@
 """
 api/server.py
 ──────────────
-Flask backend — serves real BigQuery data + manages GCP training jobs.
+Flask backend — serves real BigQuery data + manages multi-cloud training jobs.
 
-New in this version:
-  - submit_job()        → calls selector + launcher for real GCP VM
-  - get_jobs()          → reads job_state.json files from GCS
-  - preemption_poller() → background thread, watches for preempted jobs
-                          and auto-relaunches on cheapest available cloud
-  - /api/jobs/resume    → manual resume endpoint (for debugging)
+Storage:
+    ALL job state (job_state.json, job_config.json, job_command.json,
+    checkpoint .pt files) lives in S3 only.
+    BigQuery is used only for price/preemption data (read-only).
 
 Run:
     cd dashboard
     python api/server.py
 
-Endpoints (unchanged):
-    GET  /api/prices/history     → 30-point time series per cloud
-    GET  /api/prices/summary     → min/max/avg/current per cloud
-    GET  /api/prices/latest      → latest price per instance type
-    GET  /api/prices/preemptions → recent preempted=TRUE rows
-    GET  /api/stats              → total rows, preemption count
-    GET  /api/health             → BigQuery reachable?
-
-New endpoints:
-    GET  /api/jobs               → active jobs from GCS job_state.json
-    POST /api/jobs/submit        → submit new job → create GCP VM
-    POST /api/jobs/resume        → manually resume a preempted job
-    GET  /api/jobs/<job_id>      → single job state
-    GET  /api/risk               → LSTM + XGBoost preemption risk scores
+Endpoints:
+    GET  /api/prices/history         → 30-point time series per cloud
+    GET  /api/prices/summary         → min/max/avg/current per cloud
+    GET  /api/prices/latest          → latest price per instance type
+    GET  /api/prices/preemptions     → recent preempted=TRUE rows
+    GET  /api/stats                  → total rows, preemption count
+    GET  /api/health                 → BigQuery + S3 reachable?
+    GET  /api/jobs                   → all jobs from S3 job_state.json files
+    GET  /api/jobs/<job_id>          → single job state from S3
+    POST /api/jobs/submit            → submit new job → launcher.submit_job()
+    POST /api/jobs/resume            → manually resume a preempted job
+    POST /api/jobs/<job_id>/command  → send migrate/stop/reduce_lr to VM
+    GET  /api/poller/status          → preemption poller debug info
+    GET  /api/risk                   → LSTM + XGBoost preemption risk scores
 """
 
 import os
@@ -36,18 +34,18 @@ import json
 import time
 import logging
 import threading
-from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify, request
+from datetime import datetime, timezone
+
+import boto3
+from botocore.exceptions import ClientError
+from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
 from dotenv import load_dotenv
-from flask import render_template
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 load_dotenv()
 
-# ── Logging setup ─────────────────────────────────────────────────
-# Print logs go to stdout so you can see them in the terminal where
-# you run `python api/server.py`. Level=DEBUG shows all model steps.
+# ── Logging ────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -67,18 +65,98 @@ app = Flask(
 CORS(app)
 
 # ── Config ─────────────────────────────────────────────────────────
-PROJECT_ID  = os.getenv("GCP_PROJECT_ID",         "tensile-method-459009-k2")
-DATASET     = os.getenv("BIGQUERY_DATASET",        "spot_prices")
-TABLE       = os.getenv("BIGQUERY_TABLE",          "price_history")
-GCS_BUCKET  = os.getenv("CHECKPOINT_GCS_BUCKET",   "ml-scheduler-jobs-tensile-method-459009-k2")
-GCP_ZONE    = os.getenv("GCP_ZONE",                "us-central1-a")
+PROJECT_ID  = os.getenv("GCP_PROJECT_ID",        "tensile-method-459009-k2")
+DATASET     = os.getenv("BIGQUERY_DATASET",       "spot_prices")
+TABLE       = os.getenv("BIGQUERY_TABLE",         "price_history")
+GCS_BUCKET  = os.getenv("CHECKPOINT_GCS_BUCKET",  "")
+S3_BUCKET   = os.getenv("CHECKPOINT_S3_BUCKET",   "")
+GCP_ZONE    = os.getenv("GCP_ZONE",               "us-central1-a")
 
 POLLER_INTERVAL = 30
 MAX_MIGRATIONS  = 5
 
 
 # ══════════════════════════════════════════════════════════════════
-# SHARED HELPERS
+# S3 HELPERS  — all job state lives here
+# ══════════════════════════════════════════════════════════════════
+
+def _s3():
+    return boto3.client(
+        "s3",
+        aws_access_key_id     = os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY"),
+        region_name           = os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+    )
+
+
+def s3_read_json(key: str) -> dict | None:
+    """Read a JSON file from S3. Returns None if key missing or S3 not set."""
+    if not S3_BUCKET:
+        return None
+    try:
+        obj = _s3().get_object(Bucket=S3_BUCKET, Key=key)
+        return json.loads(obj["Body"].read().decode())
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return None
+        log.debug(f"[s3] read_json({key}): {e}")
+        return None
+    except Exception as e:
+        log.debug(f"[s3] read_json({key}): {e}")
+        return None
+
+
+def s3_write_json(key: str, data: dict):
+    """Write a dict as JSON to S3."""
+    if not S3_BUCKET:
+        log.warning(f"[s3] S3_BUCKET not set — skipping write to {key}")
+        return
+    try:
+        _s3().put_object(
+            Bucket      = S3_BUCKET,
+            Key         = key,
+            Body        = json.dumps(data, indent=2).encode(),
+            ContentType = "application/json",
+        )
+    except Exception as e:
+        log.error(f"[s3] write_json({key}): {e}")
+
+
+def s3_list_job_states() -> list:
+    """
+    List all checkpoints/*/job_state.json in S3.
+    Returns list of parsed state dicts with progress_pct added.
+    """
+    if not S3_BUCKET:
+        return []
+    try:
+        s3        = _s3()
+        paginator = s3.get_paginator("list_objects_v2")
+        states    = []
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="checkpoints/"):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith("job_state.json"):
+                    continue
+                try:
+                    body  = s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+                    state = json.loads(body.decode())
+                    epoch        = state.get("epoch", 0)
+                    total_epochs = state.get("total_epochs", 50)
+                    state["progress_pct"] = min(
+                        99, round((epoch / max(total_epochs, 1)) * 100)
+                    )
+                    states.append(state)
+                except Exception:
+                    pass
+        return states
+    except Exception as e:
+        log.error(f"[s3] list_job_states: {e}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════
+# BIGQUERY HELPER  — read-only, prices only
 # ══════════════════════════════════════════════════════════════════
 
 def get_bq_client():
@@ -86,55 +164,17 @@ def get_bq_client():
     return bigquery.Client(project=PROJECT_ID)
 
 
-def get_gcs_client():
-    from google.cloud import storage
-    return storage.Client(project=PROJECT_ID)
-
-
-def gcs_read_json(path):
-    client = get_gcs_client()
-    blob   = client.bucket(GCS_BUCKET).blob(path)
-    return json.loads(blob.download_as_text())
-
-
-def gcs_write_json(path, data):
-    client = get_gcs_client()
-    client.bucket(GCS_BUCKET).blob(path).upload_from_string(
-        json.dumps(data, indent=2), content_type="application/json"
-    )
-
-
-def gcs_list_job_states():
-    if not GCS_BUCKET:
-        return []
-    try:
-        client = get_gcs_client()
-        blobs  = client.bucket(GCS_BUCKET).list_blobs(prefix="checkpoints/")
-        states = []
-        for blob in blobs:
-            if blob.name.endswith("job_state.json"):
-                try:
-                    state = json.loads(blob.download_as_text())
-                    epoch        = state.get("epoch", 0)
-                    total_epochs = state.get("total_epochs", 50)
-                    state["progress_pct"] = min(
-                        99, round((epoch / max(total_epochs, 1)) * 100)
-                    )
-                    states.append(state)
-                    #print(state)
-                except Exception:
-                    pass
-        return states
-    except Exception as e:
-        print(f"[gcs] list_job_states error: {e}")
-        return []
-
-
 # ══════════════════════════════════════════════════════════════════
 # PREEMPTION POLLER
 # ══════════════════════════════════════════════════════════════════
 
 class PreemptionPoller(threading.Thread):
+    """
+    Background daemon thread.
+    Polls S3 every POLLER_INTERVAL seconds for preempted jobs,
+    then auto-relaunches them via launcher.resume_job().
+    """
+
     def __init__(self):
         super().__init__(daemon=True)
         self._stop_event      = threading.Event()
@@ -146,19 +186,19 @@ class PreemptionPoller(threading.Thread):
         self._stop_event.set()
 
     def run(self):
-        print(f"[poller] Preemption poller started — interval={POLLER_INTERVAL}s")
+        log.info(f"[poller] Started — interval={POLLER_INTERVAL}s  "
+                 f"S3={S3_BUCKET or '(not configured)'}")
         while not self._stop_event.is_set():
             try:
                 self._poll()
             except Exception as e:
-                print(f"[poller] Error: {e}")
+                log.error(f"[poller] Error in poll cycle: {e}")
             self._stop_event.wait(POLLER_INTERVAL)
 
     def _poll(self):
-        if not GCS_BUCKET:
+        if not S3_BUCKET:
             return
-        states = gcs_list_job_states()
-        for state in states:
+        for state in s3_list_job_states():
             job_id = state.get("job_id")
             status = state.get("status")
 
@@ -172,8 +212,6 @@ class PreemptionPoller(threading.Thread):
                 t.start()
 
             # ── On-demand timeout check ───────────────────────────
-            # If a job is running on an on-demand instance AND the user
-            # set spot_only=False with ondemand_max_hrs, enforce the limit.
             elif status == "running" and state.get("is_spot") is False:
                 self._check_ondemand_timeout(job_id, state)
 
@@ -190,12 +228,12 @@ class PreemptionPoller(threading.Thread):
     def _check_ondemand_timeout(self, job_id: str, state: dict):
         """
         If a running job is on on-demand and has exceeded ondemand_max_hrs,
-        write a 'migrate' command to GCS so train.py picks it up and
+        write a 'migrate' command to S3 so train.py picks it up and
         triggers a checkpoint + exit, after which the poller relaunches
         on a spot instance.
         """
         try:
-            config           = gcs_read_json(f"checkpoints/{job_id}/job_config.json")
+            config           = s3_read_json(f"checkpoints/{job_id}/job_config.json") or {}
             spot_only        = config.get("spot_only", True)
             ondemand_max_hrs = float(config.get("ondemand_max_hrs", 1.0))
 
@@ -218,12 +256,10 @@ class PreemptionPoller(threading.Thread):
                 print(f"[poller] {job_id} on-demand limit reached "
                       f"({elapsed_hrs:.2f}h >= {ondemand_max_hrs}h) — "
                       f"sending migrate command")
-                # Write migrate command — train.py checks this every epoch
-                gcs_write_json(
+                s3_write_json(
                     f"checkpoints/{job_id}/job_command.json",
                     {"command": "migrate", "reason": "ondemand_max_hrs_exceeded"}
                 )
-                # Remove from tracker — migrate will handle relaunch on spot
                 del self._ondemand_since[job_id]
 
         except Exception as e:
@@ -231,53 +267,51 @@ class PreemptionPoller(threading.Thread):
 
     def _migrate(self, job_id, state):
         try:
-            from scheduler.selector import pick_best_cloud
             from scheduler.launcher import resume_job
+            from scheduler.selector import pick_best_cloud
             try:
-                config = gcs_read_json(f"checkpoints/{job_id}/job_config.json")
+                config = s3_read_json(f"checkpoints/{job_id}/job_config.json") or {}
             except Exception:
                 config = {}
 
             migration_count = config.get("migration_count", 0)
+
             if migration_count >= MAX_MIGRATIONS:
-                print(f"[poller] Job {job_id} hit migration limit — marking failed")
-                gcs_write_json(f"checkpoints/{job_id}/job_state.json", {
-                    **state,
+                log.error(f"[poller] {job_id} hit migration limit ({MAX_MIGRATIONS}) — marking failed")
+                existing = s3_read_json(f"checkpoints/{job_id}/job_state.json") or {}
+                existing.update({
                     "status":     "failed",
                     "error":      f"Exceeded max migrations ({MAX_MIGRATIONS})",
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 })
+                s3_write_json(f"checkpoints/{job_id}/job_state.json", existing)
                 self._resuming.discard(job_id)
                 return
 
-            resume_step     = state.get("step", 0)
-            prev_cloud      = state.get("cloud", "gcp")
             cost_so_far     = float(state.get("cost_usd", 0))
             original_budget = float(config.get("max_budget", 2.0))
             remaining       = max(0.10, original_budget - cost_so_far)
 
-            # ── Pass full user preferences from original config ───
-            # Old code only passed job_id, max_budget, deadline_hrs —
-            # meaning preferred_clouds, spot_only, carbon_aware etc.
-            # were all ignored on every relaunch after preemption.
+            resume_step = state.get("step", 0)
+            prev_cloud  = state.get("cloud", "gcp")
+
             decision = pick_best_cloud({
-                "job_id":           job_id,
-                "max_budget":       remaining,
-                "deadline_hrs":     config.get("deadline_hrs",     8.0),
-                "priority":         config.get("priority",         "balanced"),
-                "spot_only":        config.get("spot_only",        True),
-                "ondemand_max_hrs": config.get("ondemand_max_hrs", 1.0),
-                "preferred_clouds": config.get("preferred_clouds", ["aws", "gcp", "azure"]),
-                "preferred_regions":config.get("preferred_regions",""),
-                "gpu_required":     config.get("gpu_required",     False),
-                "min_gpu_mem":      config.get("min_gpu_mem",      0),
-                "carbon_aware":     config.get("carbon_aware",     False),
-                "carbon_weight":    config.get("carbon_weight",    "balanced"),
-                # Training fields needed for est_hours calculation
-                "epochs":           config.get("epochs",           50),
-                "batch_size":       config.get("batch_size",       64),
-                "dataset_type":     config.get("dataset_type",     "synthetic-500k"),
-                "synthetic_rows":   config.get("synthetic_rows",   500000),
+                "job_id":            job_id,
+                "max_budget":        remaining,
+                "deadline_hrs":      config.get("deadline_hrs",      8.0),
+                "priority":          config.get("priority",          "balanced"),
+                "spot_only":         config.get("spot_only",         True),
+                "ondemand_max_hrs":  config.get("ondemand_max_hrs",  1.0),
+                "preferred_clouds":  config.get("preferred_clouds",  ["aws", "gcp", "azure"]),
+                "preferred_regions": config.get("preferred_regions", ""),
+                "gpu_required":      config.get("gpu_required",      False),
+                "min_gpu_mem":       config.get("min_gpu_mem",       0),
+                "carbon_aware":      config.get("carbon_aware",      False),
+                "carbon_weight":     config.get("carbon_weight",     "balanced"),
+                "epochs":            config.get("epochs",            50),
+                "batch_size":        config.get("batch_size",        64),
+                "dataset_type":      config.get("dataset_type",      "synthetic-500k"),
+                "synthetic_rows":    config.get("synthetic_rows",    500000),
             })
 
             result = resume_job(job_id=job_id, resume_step=resume_step,
@@ -289,55 +323,56 @@ class PreemptionPoller(threading.Thread):
                 print(f"[poller] ✗ {job_id} relaunch failed: {result.get('error')}")
                 self._resuming.discard(job_id)
         except Exception as e:
-            print(f"[poller] _migrate error for {job_id}: {e}")
+            log.error(f"[poller] _migrate error for {job_id}: {e}")
             self._resuming.discard(job_id)
 
 
+# Start poller immediately when module loads
 _poller = PreemptionPoller()
 _poller.start()
 
 
 # ══════════════════════════════════════════════════════════════════
-# RISK MODEL — load at startup with verbose print logs
+# RISK MODEL — load from local disk at startup
 # ══════════════════════════════════════════════════════════════════
 
-from risk.predictor import load_models, score_instance_from_api
+_risk_models_ready = False
 
 def _load_risk_models_bg():
-    """
-    Load LSTM + XGBoost from local disk in a background thread.
-    Verbose prints so you can see every step in the terminal.
-    """
-    print("\n" + "─"*55)
+    global _risk_models_ready
+    print("\n" + "─" * 55)
     print("[risk] ── Model load starting ──")
-    print(f"[risk]   models/     → dashboard/model/")
-    print(f"[risk]   model_data/ → dashboard/model_data/")
     try:
+        from risk.predictor import load_models
         load_models()
-        # load_models() logs its own lines via logging — these appear
-        # after it returns to confirm server is ready to score
-        print("[risk] ── Model load complete — /api/risk endpoint is live ──")
-        print("─"*55 + "\n")
+        _risk_models_ready = True
+        print("[risk] ── Model load complete — /api/risk is live ──")
+    except ImportError as e:
+        print(f"[risk] ✗ risk.predictor import failed: {e}")
+        print("[risk]   /api/risk will return 503 until fixed")
     except FileNotFoundError as e:
-        print(f"\n[risk] ✗ MISSING FILES:\n{e}")
-        print("[risk]   /api/risk will return 500 until files are present")
-        print("─"*55 + "\n")
+        print(f"[risk] ✗ Missing model files:\n  {e}")
+        print("[risk]   /api/risk will return 503 until files are present")
     except Exception as e:
         print(f"[risk] ✗ Load failed ({type(e).__name__}): {e}")
-        print("[risk]   /api/risk will return 500")
-        print("─"*55 + "\n")
+    print("─" * 55 + "\n")
+
 
 threading.Thread(target=_load_risk_models_bg, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════
-# PRICE ENDPOINTS
+# HOME
 # ══════════════════════════════════════════════════════════════════
 
 @app.route("/")
 def home():
     return render_template("index.html")
 
+
+# ══════════════════════════════════════════════════════════════════
+# PRICE ENDPOINTS  (BigQuery read-only)
+# ══════════════════════════════════════════════════════════════════
 
 @app.route("/api/prices/history")
 def price_history():
@@ -485,32 +520,47 @@ def stats():
 
 @app.route("/api/health")
 def health():
+    bq_status = "ok"
     try:
         client = get_bq_client()
         list(client.query(f"SELECT 1 FROM `{PROJECT_ID}.{DATASET}.{TABLE}` LIMIT 1"))
-        return jsonify({"status": "ok", "bigquery": "connected"})
     except Exception as e:
-        return jsonify({"status": "degraded", "bigquery": str(e)}), 200
+        bq_status = str(e)
+
+    s3_status = "ok"
+    if S3_BUCKET:
+        try:
+            _s3().head_bucket(Bucket=S3_BUCKET)
+        except Exception as e:
+            s3_status = str(e)
+    else:
+        s3_status = "(not configured)"
+
+    return jsonify({
+        "status":    "ok" if bq_status == "ok" else "degraded",
+        "bigquery":  bq_status,
+        "s3_bucket": S3_BUCKET or "(not configured)",
+        "s3":        s3_status,
+    })
 
 
 # ══════════════════════════════════════════════════════════════════
-# JOB ENDPOINTS
+# JOB ENDPOINTS  — all state from S3
 # ══════════════════════════════════════════════════════════════════
 
 @app.route("/api/jobs")
 def get_jobs():
-    if not GCS_BUCKET:
-        return jsonify([])
+    """Return all job states from S3, sorted running-first."""
     try:
-        states = gcs_list_job_states()
+        states = s3_list_job_states()
         order  = {
-            "running": 0, "migrating": 1, "queued": 2,
-            "preempted": 3, "paused": 4,
-            "done": 5, "budget_exceeded": 6,
-            "failed": 7, "launch_failed": 8,
+            "running": 0, "migrating": 1, "queued": 2, "launched": 3,
+            "preempted": 4, "paused": 5,
+            "done": 6, "budget_exceeded": 7,
+            "failed": 8, "launch_failed": 9,
         }
         states.sort(key=lambda s: (
-            order.get(s.get("status", "done"), 9),
+            order.get(s.get("status", "done"), 10),
             s.get("updated_at", "")
         ))
         return jsonify(states)
@@ -520,10 +570,11 @@ def get_jobs():
 
 @app.route("/api/jobs/<job_id>")
 def get_job(job_id):
-    if not GCS_BUCKET:
-        return jsonify({"error": "GCS_BUCKET not configured"}), 500
+    """Single job state — polled every 10s by the dashboard."""
     try:
-        state        = gcs_read_json(f"checkpoints/{job_id}/job_state.json")
+        state = s3_read_json(f"checkpoints/{job_id}/job_state.json")
+        if not state:
+            return jsonify({"error": "job_state.json not found in S3"}), 404
         epoch        = state.get("epoch", 0)
         total_epochs = state.get("total_epochs", 50)
         state["progress_pct"] = min(99, round((epoch / max(total_epochs, 1)) * 100))
@@ -533,206 +584,153 @@ def get_job(job_id):
 
 
 @app.route("/api/jobs/submit", methods=["POST"])
-def submit_job():
+def submit_job_endpoint():
+    """
+    Submit a new training job.
+
+    Flow:
+        1. Call launcher.submit_job(job_dict) which:
+              a. Runs Pareto selector (live spot prices across 3 clouds)
+              b. Writes job_config.json to S3  ← train.py reads at boot
+              c. Writes queued job_state.json to S3  ← dashboard shows immediately
+              d. Builds startup.sh (stamps JOB_ID/RESUME_STEP/PREV_CLOUD)
+              e. Launches VM with AWS→Azure→GCP fallback chain
+              f. Updates job_state.json to launched
+        2. Return immediately with decision + job_id.
+           VM creation runs in a background thread (~90s).
+           Dashboard polls /api/jobs/<job_id> every 10s for status updates.
+    """
     try:
         data   = request.json or {}
         job_id = data.get("job_id") or f"job-{int(time.time())}"
-        try:
-            from scheduler.selector import pick_best_cloud
-            from scheduler.launcher import (_write_job_config,
-                                            _write_initial_state,
-                                            _upload_trainer_files)
-        except ImportError as e:
-            return jsonify({"error": f"Scheduler module not found: {e}"}), 500
+        data["job_id"] = job_id
 
-        decision = pick_best_cloud(data)
-        try:
-            _upload_trainer_files()
-        except Exception as e:
-            return jsonify({"error": f"Trainer upload failed: {e}",
-                            "launched": False, "job_id": job_id}), 500
+        if "dataset" in data and "dataset_type" not in data:
+            data["dataset_type"] = data.pop("dataset")
 
-        dataset_type    = data.get("dataset", "synthetic-500k")
-        s3_dataset_path = data.get("s3_dataset_path", "").strip()
-        dataset_name    = data.get("dataset_name", "").strip()
-
-        if dataset_type == "custom" and not s3_dataset_path:
-            return jsonify({"error": "Custom dataset selected but no S3 path provided.",
-                            "launched": False, "job_id": job_id}), 400
-
-        synthetic_rows = {"synthetic-500k": 500_000, "synthetic-100k": 100_000}
-        config = {
-            # ─────────────────────────────────────────────
-            # Identity
-            # ─────────────────────────────────────────────
-            "job_id":            job_id,
-            "task_name":         data.get("task_name", "Untitled"),
-            "train_mode":        data.get("train_mode", "manual"),
-
-            # ─────────────────────────────────────────────
-            # Budget / scheduling
-            # ─────────────────────────────────────────────
-            "max_budget":        float(data.get("max_budget", 2.0)),
-            "deadline_hrs":      float(data.get("deadline_hrs", 8.0)),
-            "priority":          data.get("priority", "balanced"),
-
-            "spot_only":         bool(data.get("spot_only", True)),
-            "ondemand_max_hrs": float(data.get("ondemand_max_hrs", 1.0)),
-
-            # ─────────────────────────────────────────────
-            # Dataset
-            # ─────────────────────────────────────────────
-            "dataset_type":      dataset_type,
-            "dataset":           dataset_type,
-
-            "s3_dataset_path":   s3_dataset_path,
-            "dataset_name":      dataset_name or dataset_type,
-
-            "dataset_size":      int(data.get("dataset_size", 500000)),
-            "synthetic_rows":    synthetic_rows.get(dataset_type, 10000),
-
-            "input_dim":         int(data.get("input_dim", 50)),
-            "num_classes":       int(data.get("num_classes", 5)),
-
-            # ─────────────────────────────────────────────
-            # Model identity
-            # ─────────────────────────────────────────────
-            "model_arch":        data.get("model_arch", "mlp"),
-            "param_count":       data.get("param_count", "<1B"),
-            "training_paradigm": data.get("training_paradigm", "fine-tuning"),
-            "precision":         data.get("precision", "fp16"),
-
-            "min_gpu_mem":       int(data.get("min_gpu_mem", 0)),
-            "gpu_required":      bool(data.get("gpu_required", False)),
-
-            # ─────────────────────────────────────────────
-            # Manual training params
-            # ─────────────────────────────────────────────
-            "lr":                float(data.get("lr", 0.001)),
-            "hidden_dim":        int(data.get("hidden_dim", 256)),
-            "dropout":           float(data.get("dropout", 0.3)),
-            "batch_size":        int(data.get("batch_size", 64)),
-            "epochs":            int(data.get("epochs", 50)),
-            "ckpt_every":        int(data.get("ckpt_every", 50)),
-
-            # ─────────────────────────────────────────────
-            # Sweep mode params
-            # ─────────────────────────────────────────────
-            "sweep_lr_min":      float(data.get("sweep_lr_min", 0.0001)),
-            "sweep_lr_max":      float(data.get("sweep_lr_max", 0.01)),
-
-            "sweep_hidden":      data.get("sweep_hidden", [256]),
-
-            "sweep_trials":      int(data.get("sweep_trials", 5)),
-            "sweep_budget":      float(data.get("sweep_budget", 5.0)),
-
-            # ─────────────────────────────────────────────
-            # Compute preferences
-            # ─────────────────────────────────────────────
-            "preferred_clouds":  data.get(
-                "preferred_clouds",
-                ["aws", "gcp", "azure"]
-            ),
-
-            "preferred_regions": data.get("preferred_regions", ""),
-
-            "fallback":          data.get("fallback", "migrate"),
-
-            # ─────────────────────────────────────────────
-            # Carbon-aware scheduling
-            # ─────────────────────────────────────────────
-            "carbon_aware":      bool(data.get("carbon_aware", False)),
-            "carbon_weight":     data.get("carbon_weight", "balanced"),
-
-            # ─────────────────────────────────────────────
-            # Scheduler decision
-            # ─────────────────────────────────────────────
-            "cloud":             decision["cloud"],
-            "instance_type":     decision["instance_type"],
-            "region":            decision["region"],
-            "zone":              decision["zone"],
-            "price_usd_hr":      decision["price_usd_hr"],
-
-            # ─────────────────────────────────────────────
-            # Storage / checkpoints
-            # ─────────────────────────────────────────────
-            "gcs_bucket":        GCS_BUCKET,
-
-            "aws_access_key_id":
-                os.getenv("AWS_ACCESS_KEY_ID", ""),
-
-            "aws_secret_access_key":
-                os.getenv("AWS_SECRET_ACCESS_KEY", ""),
-
-            "aws_default_region":
-                os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
-
-            "checkpoint_s3_bucket":
-                os.getenv("CHECKPOINT_S3_BUCKET", ""),
-
-            # ─────────────────────────────────────────────
-            # Migration / resume
-            # ─────────────────────────────────────────────
-            "resume_from_step": 0,
-            "migration_count":  0,
-        }
-
-        if not _write_job_config(job_id, config):
-            return jsonify({"error": "Failed to write job config to GCS",
-                            "launched": False, "job_id": job_id}), 500
-
-        _write_initial_state(job_id, config, status="queued")
+        if data.get("dataset_type") == "custom" and not data.get("s3_dataset_path", "").strip():
+            return jsonify({
+                "error":    "Custom dataset selected but s3_dataset_path is empty.",
+                "launched": False,
+                "job_id":   job_id,
+            }), 400
 
         def _bg_launch():
             try:
-                from scheduler.launcher import _create_vm, _write_failed_state
-                vm = _create_vm(job_id, decision["instance_type"],
-                                resume_step=0, prev_cloud="")
-                print(f"[submit] ✓ VM created: {vm['instance_name']}")
+                from scheduler.launcher import submit_job
+                result = submit_job(data)
+                actual_cloud    = result["launch_result"].get("cloud",
+                                  result["decision"].get("cloud", "?"))
+                actual_instance = result["launch_result"].get("instance_type",
+                                  result["decision"].get("instance_type", "?"))
+                log.info(
+                    f"[submit] ✓ {job_id} launched on "
+                    f"[{actual_cloud}] {actual_instance}"
+                )
             except Exception as e:
-                print(f"[submit] ✗ VM creation failed: {e}")
-                try:
-                    from scheduler.launcher import _write_failed_state
-                    _write_failed_state(job_id, str(e))
-                except Exception:
-                    pass
+                log.error(f"[submit] ✗ VM creation failed for {job_id}: {e}")
+                s3_write_json(f"checkpoints/{job_id}/job_state.json", {
+                    "job_id":     job_id,
+                    "status":     "launch_failed",
+                    "error":      str(e),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
+
+        s3_write_json(f"checkpoints/{job_id}/job_state.json", {
+            "job_id":       job_id,
+            "task_name":    data.get("task_name", "Untitled"),
+            "status":       "queued",
+            "epoch":        0,
+            "total_epochs": int(data.get("epochs", 50)),
+            "step":         0,
+            "loss":         None,
+            "updated_at":   datetime.now(timezone.utc).isoformat(),
+        })
 
         threading.Thread(target=_bg_launch, daemon=True).start()
 
-        return jsonify({**decision, "job_id": job_id, "launched": True,
-                        "status": "queued",
-                        "message": "VM creation started (~90s to boot)."})
+        return jsonify({
+            "job_id":   job_id,
+            "launched": True,
+            "status":   "queued",
+            "message":  "VM creation started (~90s to boot). "
+                        "Poll /api/jobs/{job_id} for status.",
+        })
+
     except Exception as e:
+        log.error(f"[submit] Unexpected error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/jobs/resume", methods=["POST"])
 def manual_resume():
+    """
+    Manually resume a preempted job.
+    Body: {job_id, max_budget (optional override)}
+    """
     try:
         data   = request.json or {}
         job_id = data.get("job_id")
         if not job_id:
             return jsonify({"error": "job_id required"}), 400
-        from scheduler.selector import pick_best_cloud
-        from scheduler.launcher import resume_job
-        try:
-            state = gcs_read_json(f"checkpoints/{job_id}/job_state.json")
-        except Exception:
-            return jsonify({"error": f"job_state.json not found for {job_id}"}), 404
-        resume_step = data.get("resume_step") or state.get("step", 0)
-        prev_cloud  = state.get("cloud", "gcp")
-        try:
-            config = gcs_read_json(f"checkpoints/{job_id}/job_config.json")
-        except Exception:
-            config = {}
+
+        state = s3_read_json(f"checkpoints/{job_id}/job_state.json")
+        if not state:
+            return jsonify({"error": f"No job_state.json in S3 for {job_id}"}), 404
+
+        config      = s3_read_json(f"checkpoints/{job_id}/job_config.json") or {}
         cost_so_far = float(state.get("cost_usd", 0))
         remaining   = max(0.10, float(config.get("max_budget", 2.0)) - cost_so_far)
-        decision    = pick_best_cloud({"job_id": job_id, "max_budget": remaining,
-                                       "deadline_hrs": config.get("deadline_hrs", 8.0)})
-        result      = resume_job(job_id=job_id, resume_step=resume_step,
-                                 prev_cloud=prev_cloud, decision=decision)
-        return jsonify({**result, "job_id": job_id, "manual_resume": True,
-                        "resumed_from_step": resume_step})
+
+        job = {
+            "job_id":     job_id,
+            "max_budget": data.get("max_budget", remaining),
+        }
+
+        def _bg_resume():
+            try:
+                from scheduler.launcher import resume_job
+                result = resume_job(job)
+                log.info(
+                    f"[resume] ✓ {job_id} relaunched on "
+                    f"[{result['launch_result'].get('cloud', '?')}] "
+                    f"{result['decision'].get('instance_type', '?')}"
+                )
+            except Exception as e:
+                log.error(f"[resume] ✗ Resume failed for {job_id}: {e}")
+
+        threading.Thread(target=_bg_resume, daemon=True).start()
+
+        return jsonify({
+            "job_id":        job_id,
+            "manual_resume": True,
+            "status":        "queued",
+            "message":       "Resume started. Poll /api/jobs/{job_id} for status.",
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/jobs/<job_id>/command", methods=["POST"])
+def send_command(job_id):
+    """
+    Write job_command.json to S3.
+    train.py polls this at the top of every epoch and consumes it.
+    Body: {"command": "migrate" | "stop" | "reduce_lr"}
+    """
+    try:
+        data = request.json or {}
+        cmd  = data.get("command")
+        if cmd not in ("migrate", "stop", "reduce_lr"):
+            return jsonify({"error": "command must be: migrate | stop | reduce_lr"}), 400
+
+        s3_write_json(f"checkpoints/{job_id}/job_command.json", {
+            "command":   cmd,
+            "issued_at": datetime.now(timezone.utc).isoformat(),
+            "issued_by": "dashboard",
+        })
+        log.info(f"[command] {cmd} → s3://{S3_BUCKET}/checkpoints/{job_id}/job_command.json")
+        return jsonify({"ok": True, "job_id": job_id, "command": cmd})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -744,16 +742,23 @@ def poller_status():
         "interval_sec":       POLLER_INTERVAL,
         "max_migrations":     MAX_MIGRATIONS,
         "currently_resuming": list(_poller._resuming),
-        "gcs_bucket":         GCS_BUCKET or "(not configured)",
+        "s3_bucket":          S3_BUCKET or "(not configured)",
     })
 
 
 # ══════════════════════════════════════════════════════════════════
-# RISK ENDPOINT — verbose print logs so you can trace every step
+# RISK ENDPOINT
 # ══════════════════════════════════════════════════════════════════
 
 @app.route("/api/risk")
 def risk_scores():
+    if not _risk_models_ready:
+        return jsonify({
+            "error": "Risk models not yet loaded — check server logs for details. "
+                     "All other endpoints are working normally.",
+            "retry_after_seconds": 10,
+        }), 503
+
     sep = "─" * 55
     ts  = datetime.now().strftime("%H:%M:%S")
     print(f"\n{sep}")
@@ -761,14 +766,12 @@ def risk_scores():
 
     try:
         # ── Step 1: Read running jobs from S3 ─────────────────────
-        # ── Step 1: Read running jobs from S3 ─────────────────────
         import boto3, json as _json
         s3         = boto3.client("s3")
-        bucket     = os.getenv("CHECKPOINT_BUCKET", "ml-scheduler-checkpoints")
+        bucket     = os.getenv("CHECKPOINT_S3_BUCKET", S3_BUCKET)
         paginator  = s3.get_paginator("list_objects_v2")
         pages      = paginator.paginate(Bucket=bucket, Prefix="checkpoints/")
 
-        # Statuses that mean the job is actively running on an instance
         ACTIVE_STATUSES = {"running", "launched", "migrating"}
 
         running_jobs = []
@@ -795,15 +798,13 @@ def risk_scores():
         from risk.predictor import score_instance_from_api
         results = []
         for job in running_jobs:
-            job_id   = job.get("job_id", "unknown")
-            
-            # Cloud/region/instance may be at top level OR inside launch_result
-            launch   = job.get("launch_result", {})
+            job_id = job.get("job_id", "unknown")
 
-            cloud         = job.get("cloud")         or launch.get("cloud",         "aws")
-            region        = launch.get("region")     or job.get("region",           "")
+            launch        = job.get("launch_result", {})
+            cloud         = job.get("cloud")         or launch.get("cloud",          "aws")
+            region        = launch.get("region")     or job.get("region",            "")
             az            = launch.get("az")         or job.get("availability_zone", "") or job.get("zone", "")
-            instance_type = launch.get("instance_type") or job.get("instance",      "") or job.get("instance_type", "")
+            instance_type = launch.get("instance_type") or job.get("instance",       "") or job.get("instance_type", "")
 
             print(f"[risk] ── Job {job_id}: {cloud}/{instance_type}/{region}/{az or 'no-az'}")
 
@@ -812,15 +813,12 @@ def risk_scores():
                 continue
 
             try:
-                # In your /api/risk route, you already have bq_client somewhere
-                # (or initialize it there). Pass it along:
-
                 risk = score_instance_from_api(
                     cloud         = cloud,
                     region        = region,
                     az            = az,
                     instance_type = instance_type,
-                    bq_client     = get_bq_client(),   # ← add this
+                    bq_client     = get_bq_client(),
                 )
                 level = "HIGH" if risk >= 0.6 else "MED" if risk >= 0.3 else "LOW"
                 print(f"[risk]   risk={risk:.4f}  ← {level}")
@@ -848,20 +846,6 @@ def risk_scores():
         print(sep + "\n")
         return jsonify({"error": str(e)}), 500
 
-def _score_with_logs(cloud, region, az, instance_type, bq_client) -> float:
-    """
-    Verbose wrapper around score_instance().
-    All the detailed logging is now inside predictor.py itself.
-    """
-    from risk.predictor import score_instance as _score
-    return _score(
-        cloud         = cloud,
-        region        = region,
-        az            = az,
-        instance_type = instance_type,
-        bq_client     = bq_client,
-    )
-
 
 # ══════════════════════════════════════════════════════════════════
 
@@ -870,8 +854,9 @@ if __name__ == "__main__":
     print(f"  Multi-Cloud Scheduler — API server")
     print(f"  Project  : {PROJECT_ID}")
     print(f"  BigQuery : {PROJECT_ID}.{DATASET}.{TABLE}")
-    print(f"  GCS      : {GCS_BUCKET or '(not set — job features disabled)'}")
+    print(f"  S3 bucket: {S3_BUCKET or '(not set — job features disabled)'}")
+    print(f"  GCS      : {GCS_BUCKET or '(not set)'}")
     print(f"  Poller   : every {POLLER_INTERVAL}s · max {MAX_MIGRATIONS} migrations")
     print(f"{'═'*55}\n")
     app.run(host="0.0.0.0", port=5050, debug=True, use_reloader=False)
-    # use_reloader=False — prevents two poller threads starting
+    # use_reloader=False — prevents two poller threads starting in debug mode

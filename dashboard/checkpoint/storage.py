@@ -1,21 +1,20 @@
 """
 checkpoint/storage.py
 ──────────────────────
-Handles upload and download of checkpoint files to GCS and S3.
+Handles upload and download of checkpoint files.
+S3 is the single source of truth — no GCS.
 
-engine.py calls this — it doesn't know which cloud it's talking to.
-Both uploads happen simultaneously using asyncio so total upload
-time = max(GCS time, S3 time), not GCS time + S3 time.
+engine.py calls this — it doesn't know or care which cloud the VM runs on.
+All three clouds (GCP, AWS, Azure) write checkpoints and job state to S3.
 
-Buckets are configured via .env:
-    CHECKPOINT_GCS_BUCKET = your-gcs-bucket
+Buckets are configured via env vars (set in startup script at boot):
     CHECKPOINT_S3_BUCKET  = your-s3-bucket
     AWS_ACCESS_KEY_ID     = ...
     AWS_SECRET_ACCESS_KEY = ...
+    AWS_DEFAULT_REGION    = us-east-1
 """
 
 import os
-import io
 import logging
 import asyncio
 from pathlib import Path
@@ -23,15 +22,13 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
-def gcs_file_exists(gcs_path: str) -> bool:
-
-
-# ── S3 ────────────────────────────────────────────────────────────────────────
+# ── S3 ────────────────────────────────────────────────────────────
 
 def upload_to_s3(local_path: str, s3_path: str) -> bool:
     """
     Upload a local file to S3.
-    s3_path: path inside the bucket, e.g. 'checkpoints/job1/step_000500.pt'
+    s3_path: key inside the bucket, e.g. 'checkpoints/job1/step_000500.pt'
+    Returns True on success, False on failure.
     """
     bucket_name = os.getenv("CHECKPOINT_S3_BUCKET")
     if not bucket_name:
@@ -55,7 +52,10 @@ def upload_to_s3(local_path: str, s3_path: str) -> bool:
 
 
 def download_from_s3(s3_path: str, local_path: str) -> bool:
-    """Download a file from S3 to local disk."""
+    """
+    Download a file from S3 to local disk.
+    Returns True on success, False on failure.
+    """
     bucket_name = os.getenv("CHECKPOINT_S3_BUCKET")
     if not bucket_name:
         log.warning("CHECKPOINT_S3_BUCKET not set — cannot download from S3")
@@ -78,6 +78,7 @@ def download_from_s3(s3_path: str, local_path: str) -> bool:
 
 
 def s3_file_exists(s3_path: str) -> bool:
+    """Check if a key exists in S3. Returns True/False."""
     bucket_name = os.getenv("CHECKPOINT_S3_BUCKET")
     if not bucket_name:
         return False
@@ -95,25 +96,23 @@ def s3_file_exists(s3_path: str) -> bool:
         return False
 
 
-
-# ── S3 async upload for compatibility ──
 async def upload_to_s3_async(local_path: str, s3_path: str) -> dict:
     """
-    Upload the file to S3 asynchronously (for compatibility with engine.py).
+    Upload a file to S3 asynchronously (called by engine.save()).
     Returns: {"s3": True/False}
     """
-    loop = asyncio.get_event_loop()
+    loop      = asyncio.get_event_loop()
     s3_result = await loop.run_in_executor(None, upload_to_s3, local_path, s3_path)
     return {"s3": s3_result}
 
 
-def download_best_available(remote_path: str, local_path: str) -> str:
+def download_best_available(remote_path: str, local_path: str) :
     """
-    Download checkpoint from S3 only.
-    Returns: "s3" | None
+    Download checkpoint from S3.
+    Returns: "s3" on success, None if not found.
     """
     if s3_file_exists(remote_path):
-        log.info(f"Checkpoint found on S3 — downloading from S3")
+        log.info(f"Checkpoint found on S3 — downloading")
         if download_from_s3(remote_path, local_path):
             return "s3"
     log.warning(f"Checkpoint not found on S3: {remote_path}")
