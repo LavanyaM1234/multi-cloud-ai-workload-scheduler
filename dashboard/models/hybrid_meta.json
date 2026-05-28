@@ -1,0 +1,12 @@
+{
+  "model_type": "LSTM+XGBoost Hybrid Regression",
+  "target": "risk_score (continuous 0-1)",
+  "lstm_out_dim": 8,
+  "sequence_len": 60,
+  "n_features": 29,
+  "hybrid_features": 37,
+  "test_mae": 0.0007281781290657818,
+  "test_rmse": 0.001233057189485633,
+  "test_r2": 0.992324948310852,
+  "test_spearman": 0.9265289366113124
+}
