@@ -20,32 +20,12 @@ Why S3 for all JSON files:
     All three clouds can read/write S3 — it is the single source of truth.
     GCS is only used by GCP VMs for .pt checkpoint file storage.
 
-Does the startup script run automatically?
-    YES — each cloud launcher injects it differently but it always runs:
-        GCP   → passed as instance metadata "startup-script"; GCP runs it
-                automatically on first boot via the google-startup-scripts
-                service (no SSH required).
-        AWS   → passed as base64 UserData; cloud-init runs it at first boot
-                automatically before the instance is marked running.
-        Azure → passed as base64 customData; cloud-init on the Ubuntu image
-                runs it at first boot automatically.
-    In all three cases: VM boots → cloud-init / startup service picks up the
-    script → runs as root → installs deps, downloads trainer/ from S3,
-    runs train.py, shuts down. You never need to SSH in.
-
-Is the startup script generic across all clouds?
-    YES — the same bash script body runs on GCP, AWS, and Azure.
-    The only difference is how credentials + bucket names reach the VM:
-        GCP   → curl metadata.google.internal to read them
-        AWS   → they're already exported as env vars by the UserData preamble
-                that aws_launcher prepends before injecting
-        Azure → same; azure_launcher prepends an env-export preamble
-
-Startup script downloads trainer/ from S3:
-    s3://$CHECKPOINT_S3_BUCKET/trainer/train.py
-    s3://$CHECKPOINT_S3_BUCKET/trainer/checkpoint_pkg.tar.gz
-    You must upload these files to S3 before submitting any job.
-    See: scripts/upload_trainer.sh
+Shutdown hook (added to all cloud startup scripts):
+    Runs after train.py exits for ANY reason (clean, crash, preemption).
+    Logs to /var/log/trainer.log (same file as everything else).
+    Updates job_state.json → status=preempted (if not already terminal).
+    Updates job_config.json → migration_count++, resume_from_step=last step.
+    To view logs on the VM: sudo tail -f /var/log/trainer.log
 """
 
 from __future__ import annotations
@@ -68,18 +48,16 @@ logger = logging.getLogger(__name__)
 # ── Env ───────────────────────────────────────────────────────────
 JOB_STATE_PATH = os.getenv("JOB_STATE_PATH",        "job_state.json")
 S3_BUCKET      = os.getenv("CHECKPOINT_S3_BUCKET",  "")
-GCS_BUCKET     = os.getenv("CHECKPOINT_GCS_BUCKET", "")   # GCP .pt storage only
+GCS_BUCKET     = os.getenv("CHECKPOINT_GCS_BUCKET", "")
 
-# ── Fallback order ────────────────────────────────────────────────
 _FALLBACK_CHAIN = ["aws", "azure", "gcp"]
 
 
 # ══════════════════════════════════════════════════════════════════
-# S3 helpers  (all JSON state lives here)
+# S3 helpers
 # ══════════════════════════════════════════════════════════════════
 
 def _s3_client():
-    """Return a boto3 S3 client using env credentials."""
     return boto3.client(
         "s3",
         aws_access_key_id     = os.getenv("AWS_ACCESS_KEY_ID"),
@@ -89,14 +67,7 @@ def _s3_client():
 
 
 def _s3_put_json(key: str, data: dict) -> bool:
-    """
-    Write a dict as JSON to s3://S3_BUCKET/{key}.
-    Returns True on success, False on failure.
-    Logs to local file as fallback when S3_BUCKET is not configured
-    (useful for local testing without real AWS creds).
-    """
     if not S3_BUCKET:
-        # Local fallback — write alongside job_state.json for testing
         local = Path(key.replace("/", "_"))
         local.write_text(json.dumps(data, indent=2))
         logger.warning(f"[Launcher] S3_BUCKET not set — wrote {key} locally to {local}")
@@ -116,7 +87,6 @@ def _s3_put_json(key: str, data: dict) -> bool:
 
 
 def _s3_get_json(key: str) -> Optional[dict]:
-    """Read JSON from s3://S3_BUCKET/{key}. Returns None on any error."""
     if not S3_BUCKET:
         return None
     try:
@@ -137,21 +107,6 @@ def _s3_get_json(key: str) -> Optional[dict]:
 # ══════════════════════════════════════════════════════════════════
 
 def _write_job_config(job_id: str, config: dict) -> bool:
-    """
-    Write job_config.json to S3 BEFORE the VM boots.
-
-    This is the file train.py's load_config() reads at startup:
-        s3://CHECKPOINT_S3_BUCKET/checkpoints/{job_id}/job_config.json
-
-    It contains all training hyperparameters (epochs, lr, batch_size,
-    hidden_dim, etc.) plus job metadata (task_name, max_budget,
-    price_usd_hr, migration_count).
-
-    If this isn't written before the VM starts, train.py falls back
-    to defaults and loses all your submitted parameters.
-
-    Returns True on success so submit_job() can abort on failure.
-    """
     key = f"checkpoints/{job_id}/job_config.json"
     ok  = _s3_put_json(key, config)
     if ok:
@@ -163,20 +118,6 @@ def _write_job_config(job_id: str, config: dict) -> bool:
 
 def _write_initial_state(job_id: str, config: dict, decision: dict,
                           status: str = "queued"):
-    """
-    Write job_state.json to S3 immediately after config upload.
-
-    Purpose: the dashboard (server.py) polls job_state.json to show
-    job status. Without this write, the dashboard shows nothing while
-    the VM is still booting (typically 2–3 minutes).
-
-    After this write the dashboard immediately shows status=queued,
-    then launched once the VM is created, then running once train.py
-    starts writing its own updates.
-
-    CheckpointEngine in train.py will overwrite this with live progress
-    (step, loss, accuracy, cost_usd, etc.) after every checkpoint save.
-    """
     key   = f"checkpoints/{job_id}/job_state.json"
     state = {
         "job_id":          job_id,
@@ -203,13 +144,7 @@ def _write_initial_state(job_id: str, config: dict, decision: dict,
 
 def _write_launched_state(job_id: str, config: dict, decision: dict,
                            launch_result: dict):
-    """
-    Update job_state.json to status=launched once the VM is confirmed running.
-    Adds the actual instance ID / IP from the launch result.
-    """
-    key = f"checkpoints/{job_id}/job_state.json"
-
-    # Merge over the initial state rather than replacing it
+    key      = f"checkpoints/{job_id}/job_state.json"
     existing = _s3_get_json(key) or {}
     existing.update({
         "status":          "launched",
@@ -228,11 +163,7 @@ def _write_launched_state(job_id: str, config: dict, decision: dict,
 
 
 def _write_failed_state(job_id: str, error: str):
-    """
-    Write status=launch_failed to S3 when the VM creation itself throws.
-    Lets the dashboard show an error instead of hanging on queued forever.
-    """
-    key = f"checkpoints/{job_id}/job_state.json"
+    key      = f"checkpoints/{job_id}/job_state.json"
     existing = _s3_get_json(key) or {}
     existing.update({
         "status":     "launch_failed",
@@ -244,55 +175,17 @@ def _write_failed_state(job_id: str, error: str):
 
 
 # ══════════════════════════════════════════════════════════════════
-# Public API  (backward-compatible)
+# Public API
 # ══════════════════════════════════════════════════════════════════
 
 def submit_job(job: dict) -> dict:
-    """
-    Main entry point. Full sequence:
-        1. Assign job_id
-        2. Build job_config dict from job params
-        3. Run Pareto selector to pick best cloud + instance
-        4. Write job_config.json to S3  ← train.py reads this at boot
-        5. Write initial job_state.json (status=queued) to S3
-        6. Build startup.sh (stamps JOB_ID / RESUME_STEP / PREV_CLOUD)
-        7. Launch VM (with AWS→Azure→GCP fallback chain)
-        8. Update job_state.json to status=launched
-        9. On any VM launch failure: write status=launch_failed
-
-    Args:
-        job: dict — keys your API / server.py passes in:
-            job_id          str    (auto-generated if absent)
-            task_name       str    human-readable label
-            lr              float  learning rate          (default 0.001)
-            hidden_dim      int    MLP hidden size        (default 256)
-            dropout         float                         (default 0.3)
-            batch_size      int                           (default 64)
-            epochs          int    total training epochs  (default 50)
-            ckpt_every      int    steps between saves    (default 50)
-            input_dim       int    feature count          (default 50)
-            num_classes     int                           (default 5)
-            max_budget      float  $ spend cap            (default 2.0)
-            deadline_hrs    float  must finish within N h (default 8.0)
-            min_gpu_mem     float  minimum VRAM GB        (default 0)
-            dataset_type    str    "synthetic-500k"|"custom"
-            s3_dataset_path str    s3://bucket/prefix/ for custom data
-            resume_step     int    0 = fresh, N = resume  (default 0)
-            prev_cloud      str    cloud migrated from    (default "")
-            migration_count int    how many migrations    (default 0)
-
-    Returns:
-        {"job_id", "decision", "launch_result"}
-    """
     job_id = job.get("job_id", f"job-{int(time.time())}")
     job["job_id"] = job_id
 
     logger.info(f"[Launcher] ▶ submit_job: {job_id}")
 
-    # ── 1. Select best cloud ──────────────────────────────────────
     try:
         decision = pick_best_cloud(job)
-        print(job)
         decision["job_id"] = job_id
         logger.info(
             f"[Launcher] Selector → [{decision['cloud']}] "
@@ -304,10 +197,6 @@ def submit_job(job: dict) -> dict:
         logger.error(f"[Launcher] Selector failed: {e} — using emergency fallback")
         decision = _emergency_decision(job)
 
-    # ── 2. Build job_config — what train.py reads at boot ─────────
-    # Every key here has a matching config.setdefault() in train.py's
-    # load_config(). If a key is missing here, train.py uses its own
-    # default — these values WIN over train.py defaults.
     job_config = {
         "job_id":            job_id,
         "task_name":         job.get("task_name",      "Untitled"),
@@ -322,36 +211,29 @@ def submit_job(job: dict) -> dict:
         "max_budget":        float(job.get("max_budget", 2.0)),
         "dataset_type":      job.get("dataset_type",    "synthetic-500k"),
         "s3_dataset_path":   job.get("s3_dataset_path", ""),
-        # Runtime metadata read by train.py for cost tracking
         "price_usd_hr":      decision["price_usd_hr"],
         "instance_type":     decision["instance_type"],
         "cloud":             decision["cloud"],
-        # Resume / migration metadata
         "resume_from_step":  int(job.get("resume_step",       0)),
         "migration_count":   int(job.get("migration_count",   0)),
         "gcs_bucket":        GCS_BUCKET,
     }
 
-    # ── 3. Write job_config.json to S3 BEFORE VM boots ───────────
     if not _write_job_config(job_id, job_config):
         error = "Could not write job_config.json to S3 — aborting launch"
         _write_failed_state(job_id, error)
         raise RuntimeError(f"[Launcher] {error}")
 
-    # ── 4. Write initial queued state so dashboard shows it now ──
     _write_initial_state(job_id, job_config, decision, status="queued")
 
-    # ── 5. Build startup script (stamps JOB_ID/RESUME_STEP/PREV_CLOUD) ──
     startup_script = _build_training_script(job, decision)
 
-    # ── 6. Launch VM with fallback chain ─────────────────────────
     try:
         launch_result = _launch_with_fallback(decision, startup_script, job)
     except Exception as e:
         _write_failed_state(job_id, str(e))
         raise
 
-    # ── 7. Update state to launched ──────────────────────────────
     _write_launched_state(job_id, job_config, decision, launch_result)
 
     logger.info(f"[Launcher] ✓ Job {job_id} launched on [{launch_result.get('cloud')}]")
@@ -363,38 +245,14 @@ def submit_job(job: dict) -> dict:
 
 
 def resume_job(job: dict) -> dict:
-    """
-    Resume a preempted job.
-
-    End-to-end flow:
-        server.py polls job_state.json on S3 → sees status=preempted
-        → calls resume_job({"job_id": "job-123"})
-        → we read prev step from job_state.json on S3
-        → confirm checkpoint_latest.pt exists on S3
-        → call submit_job() with resume_step=N and prev_cloud=X
-        → submit_job() writes updated job_config (resume_from_step=N)
-        → new VM boots, reads RESUME_STEP from env
-        → train.py calls engine.load() → downloads checkpoint_latest.pt
-        → training continues from step N on potentially a different cloud
-
-    Args:
-        job: dict with job_id (required). All other keys are optional
-             overrides (e.g. bump max_budget for the retry).
-    """
     job_id = job.get("job_id")
     if not job_id:
         raise ValueError("[Launcher] resume_job requires job_id")
 
     logger.info(f"[Launcher] ↺ resume_job: {job_id}")
 
-    # ── Read previous job_config from S3 to carry params forward ─
     prev_config = _s3_get_json(f"checkpoints/{job_id}/job_config.json") or {}
     if prev_config:
-        logger.info(
-            f"[Launcher] Loaded previous config: epochs={prev_config.get('epochs')} "
-            f"lr={prev_config.get('lr')} cloud={prev_config.get('cloud')}"
-        )
-        # Merge prev_config under job (job keys win — lets caller override)
         merged = {**prev_config, **job}
         merged["job_id"] = job_id
     else:
@@ -404,21 +262,14 @@ def resume_job(job: dict) -> dict:
 
     prev_cloud = prev_config.get("cloud", "")
 
-    # ── Find checkpoint on S3 ─────────────────────────────────────
     checkpoint_path, resume_step = _find_latest_checkpoint(job_id)
     if checkpoint_path:
-        logger.info(
-            f"[Launcher] Checkpoint found: {checkpoint_path}  step={resume_step}"
-        )
-        merged["resume_step"]    = resume_step
-        merged["prev_cloud"]     = prev_cloud
+        merged["resume_step"]     = resume_step
+        merged["prev_cloud"]      = prev_cloud
         merged["migration_count"] = int(prev_config.get("migration_count", 0)) + 1
     else:
-        logger.warning(
-            f"[Launcher] No checkpoint on S3 for {job_id} — starting fresh"
-        )
-        merged["resume_step"]    = 0
-        merged["prev_cloud"]     = ""
+        merged["resume_step"]     = 0
+        merged["prev_cloud"]      = ""
         merged["migration_count"] = 0
 
     return submit_job(merged)
@@ -429,160 +280,78 @@ def resume_job(job: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════
 
 def _decision_for_cloud(original_decision: dict, target_cloud: str) -> dict:
-    """
-    Build a cloud-specific decision dict for the fallback target.
-
-    The root cause of the bug in the logs:
-        Azure wins the Pareto selection → decision has:
-            instance_type = "Standard_NC4as_T4_v3"
-            region        = "centralindia"
-            zone          = "centralindia"
-        When Azure fails, the SAME dict was passed to AWS and GCP
-        launchers unchanged — AWS tried to launch "Standard_NC4as_T4_v3"
-        (an Azure SKU name), GCP tried zone "centralindia" (doesn't exist).
-
-    Fix: when falling back, look up the best available instance for
-    the target cloud from the Pareto set first, then from the full
-    provider catalog. Always use that cloud's own region/zone env vars.
-    """
     if original_decision["cloud"] == target_cloud:
-        return dict(original_decision)   # no remap needed
+        return dict(original_decision)
 
-    # ── Try to find a Pareto candidate for the target cloud ───────
-    pareto_set = original_decision.get("pareto_set", [])
+    pareto_set       = original_decision.get("pareto_set", [])
     cloud_candidates = [p for p in pareto_set if p.get("cloud") == target_cloud]
     if cloud_candidates:
-        # Pick lowest cost from that cloud's Pareto candidates
-        best = min(cloud_candidates, key=lambda p: p.get("est_cost", 999))
+        best     = min(cloud_candidates, key=lambda p: p.get("est_cost", 999))
         fallback = dict(best)
         fallback["job_id"] = original_decision.get("job_id", "")
         logger.info(
             f"[Launcher] Fallback remapped to [{target_cloud}] "
-            f"{fallback['instance_type']}  "
-            f"${fallback.get('price_usd_hr', 0):.4f}/hr  "
-            f"est_cost=${fallback.get('est_cost', 0):.2f}  "
-            f"(from Pareto set)"
+            f"{fallback['instance_type']}  (from Pareto set)"
         )
         return fallback
 
-    # ── No Pareto candidate — use default approved instance ───────
-    # These are the cheapest approved GPU instance per cloud
     _CLOUD_DEFAULTS = {
         "aws": {
             "cloud":           "aws",
             "instance_type":   "t3.medium",
             "region":          os.getenv("AWS_REGION", "us-east-1"),
             "zone":            os.getenv("AWS_REGION", "us-east-1") + "a",
-            "price_usd_hr":    0.013,    # t3.medium spot
+            "price_usd_hr":    0.013,
             "est_hours":       original_decision.get("est_hours", 4.0),
             "est_cost":        original_decision.get("est_cost",  0.05),
             "preemption_risk": 0.03,
-            "gpu_model":       None,
-            "gpu_mem_gb":      0,
-            "gpu_count":       0,
-            "vcpus":           2,
-            "ram_gb":          4,
+            "gpu_model": None, "gpu_mem_gb": 0, "gpu_count": 0,
+            "vcpus": 2, "ram_gb": 4,
         },
         "gcp": {
             "cloud":           "gcp",
             "instance_type":   "e2-standard-4",
             "region":          os.getenv("GCP_REGION", "us-central1"),
             "zone":            os.getenv("GCP_ZONE",   "us-central1-a"),
-            "price_usd_hr":    0.034,    # e2-standard-4 spot
+            "price_usd_hr":    0.034,
             "est_hours":       original_decision.get("est_hours", 4.0),
             "est_cost":        original_decision.get("est_cost",  0.14),
             "preemption_risk": 0.05,
-            "gpu_model":       None,
-            "gpu_mem_gb":      0,
-            "gpu_count":       0,
-            "vcpus":           4,
-            "ram_gb":          16,
+            "gpu_model": None, "gpu_mem_gb": 0, "gpu_count": 0,
+            "vcpus": 4, "ram_gb": 16,
         },
         "azure": {
             "cloud":           "azure",
             "instance_type":   "Standard_D2as_v4",
             "region":          os.getenv("AZURE_LOCATION", "centralindia"),
             "zone":            os.getenv("AZURE_LOCATION", "centralindia"),
-            "price_usd_hr":    0.022,    # Standard_D2as_v4 spot
+            "price_usd_hr":    0.022,
             "est_hours":       original_decision.get("est_hours", 4.0),
             "est_cost":        original_decision.get("est_cost",  0.09),
             "preemption_risk": 0.04,
-            "gpu_model":       None,
-            "gpu_mem_gb":      0,
-            "gpu_count":       0,
-            "vcpus":           2,
-            "ram_gb":          8,
+            "gpu_model": None, "gpu_mem_gb": 0, "gpu_count": 0,
+            "vcpus": 2, "ram_gb": 8,
         },
     }
     fallback = dict(_CLOUD_DEFAULTS.get(target_cloud, _CLOUD_DEFAULTS["gcp"]))
     fallback["job_id"] = original_decision.get("job_id", "")
     logger.info(
         f"[Launcher] Fallback remapped to [{target_cloud}] "
-        f"{fallback['instance_type']}  "
-        f"${fallback['price_usd_hr']:.4f}/hr  "
-        f"(default — no Pareto candidate found for {target_cloud})"
+        f"{fallback['instance_type']}  (default)"
     )
     return fallback
 
 
 def _launch_with_fallback(decision: dict, startup_script: str, job: dict) -> dict:
-    """
-    Try the chosen cloud first, then rotate through the fallback chain.
-
-    Key fix vs previous version:
-        Each fallback attempt gets a REMAPPED decision dict with the
-        correct instance_type / region / zone for THAT cloud.
-        Previously the original decision (e.g. Azure's Standard_NC4as_T4_v3
-        in centralindia) was passed unchanged to AWS and GCP launchers,
-        causing InvalidParameterValue and 403 zone-not-found errors.
-
-    Also detects "No module named 'azure'" and skips Azure gracefully
-    with a clear install hint rather than showing a traceback.
-
-    Last resort: GCP on-demand (not spot) if all spot attempts fail.
-    """
     job_id       = decision.get("job_id", "unknown")
     chosen_cloud = decision["cloud"]
     attempted    = []
     order        = [chosen_cloud] + [c for c in _FALLBACK_CHAIN if c != chosen_cloud]
 
-    # ── Log the live price snapshot for this job ──────────────────
-    logger.info(
-        f"[Launcher] ── Live price snapshot for job {job_id} ──────────"
-    )
-    pareto = decision.get("pareto_set", [])
-    if pareto:
-        for p in sorted(pareto, key=lambda x: x.get("est_cost", 999)):
-            logger.info(
-                f"[Launcher]   [{p.get('cloud','?'):5}] "
-                f"{p.get('instance_type','?'):28} "
-                f"${p.get('price_usd_hr', 0):.4f}/hr  "
-                f"est_total=${p.get('est_cost', 0):.3f}  "
-                f"risk={p.get('preemption_risk', 0):.2f}  "
-                f"gpu={p.get('gpu_model','CPU')}"
-            )
-    else:
-        logger.info(
-            f"[Launcher]   [{decision.get('cloud','?'):5}] "
-            f"{decision.get('instance_type','?'):28} "
-            f"${decision.get('price_usd_hr', 0):.4f}/hr  "
-            f"est_total=${decision.get('est_cost', 0):.3f}  "
-            f"risk={decision.get('preemption_risk', 0):.2f}"
-        )
-    logger.info(f"[Launcher] ────────────────────────────────────────────────")
-
     for cloud in order:
         attempted.append(cloud)
-
-        # Remap instance_type / region / zone for this specific cloud
         cloud_decision = _decision_for_cloud(decision, cloud)
-
-        # Build a cloud-specific startup script.
-        # AWS uses Amazon Linux 2023 (dnf, no apt-get, awscli pre-installed).
-        # GCP/Azure use Ubuntu 22.04 (apt-get, awscli installed via apt).
-        # Stamping CLOUD at generation time here is correct because
-        # cloud_decision["cloud"] == cloud at this point.
-        cloud_script = _build_training_script(job, cloud_decision)
+        cloud_script   = _build_training_script(job, cloud_decision)
 
         logger.info(
             f"[Launcher] Trying [{cloud}]  "
@@ -605,51 +374,38 @@ def _launch_with_fallback(decision: dict, startup_script: str, job: dict) -> dic
 
             result["cloud"]         = cloud
             result["instance_type"] = cloud_decision["instance_type"]
-            logger.info(
-                f"[Launcher] ✓ Launch succeeded on [{cloud}]  "
-                f"instance={cloud_decision['instance_type']}"
-            )
+            logger.info(f"[Launcher] ✓ Launch succeeded on [{cloud}]")
             return result
+
         except ModuleNotFoundError as e:
-            # Azure SDK (azure-mgmt-compute etc.) not installed
             if "azure" in str(e).lower():
                 logger.warning(
                     f"[Launcher] ✗ [{cloud}] skipped — Azure SDK not installed. "
-                    f"Fix: pip install azure-identity azure-mgmt-compute azure-mgmt-network  "
-                    f"(tried: {attempted})"
+                    f"Fix: pip install azure-identity azure-mgmt-compute azure-mgmt-network"
                 )
             else:
-                logger.error(f"[Launcher] ✗ [{cloud}] missing module: {e}  (tried: {attempted})")
+                logger.error(f"[Launcher] ✗ [{cloud}] missing module: {e}")
             if cloud != order[-1]:
                 logger.info("[Launcher] Trying next cloud in fallback chain...")
 
         except Exception as e:
-            logger.error(
-                f"[Launcher] ✗ [{cloud}] failed: {e}  (tried: {attempted})"
-            )
+            logger.error(f"[Launcher] ✗ [{cloud}] failed: {e}  (tried: {attempted})")
             if cloud != order[-1]:
                 logger.info("[Launcher] Trying next cloud in fallback chain...")
 
-    # ── All spot attempts failed → GCP on-demand ─────────────────
-    logger.error(
-        f"[Launcher] All spot clouds failed {attempted} → trying GCP on-demand"
-    )
+    # All spot failed → GCP on-demand
+    logger.error(f"[Launcher] All spot clouds failed {attempted} → trying GCP on-demand")
     try:
         gcp_decision         = _decision_for_cloud(decision, "gcp")
         gcp_decision["spot"] = False
         gcp_script           = _build_training_script(job, gcp_decision)
-        result = _launch_gcp(gcp_decision, gcp_script, on_demand=True)
-        result["cloud"]     = "gcp"
-        result["on_demand"] = True
-        logger.warning(
-            f"[Launcher] ⚠ Running on GCP on-demand: "
-            f"{gcp_decision['instance_type']} in {gcp_decision.get('zone','?')}"
-        )
+        result               = _launch_gcp(gcp_decision, gcp_script, on_demand=True)
+        result["cloud"]      = "gcp"
+        result["on_demand"]  = True
         return result
     except Exception as e:
         raise RuntimeError(
-            f"[Launcher] All launch attempts failed "
-            f"({attempted} + on-demand): {e}"
+            f"[Launcher] All launch attempts failed ({attempted} + on-demand): {e}"
         )
 
 
@@ -674,28 +430,21 @@ def _launch_azure(decision: dict, startup_script: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
-# Startup script
+# Startup script builder
 # ══════════════════════════════════════════════════════════════════
 
 def _build_training_script(job: dict, decision: dict) -> str:
     """
-    Return a cloud-specific startup script for the VM being launched.
+    Build a cloud-specific startup script.
 
-    Why separate scripts per cloud:
-        GCP / Azure  — Ubuntu 22.04, uses apt-get, awscli not pre-installed
-        AWS          — Amazon Linux 2023, uses dnf, awscli v2 pre-installed,
-                       NO apt-get (that's what caused the error)
+    GCP / Azure  — Ubuntu 22.04, apt-get, awscli via apt
+    AWS          — Amazon Linux 2023, dnf, awscli v2 pre-installed
 
-    The cloud value IS stamped at generation time here because this function
-    is called inside _launch_with_fallback() AFTER cloud_decision is resolved
-    for the specific cloud being launched — not from the original Pareto winner.
-    So "cloud" correctly reflects which VM is actually being created.
-
-    Values stamped at generation time (safe — VM metadata only readable
-    by the instance owner):
-        JOB_ID, RESUME_STEP, PREV_CLOUD, CLOUD
-        CHECKPOINT_S3_BUCKET, AWS_ACCESS_KEY_ID,
-        AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
+    Shutdown hook (all clouds):
+        Runs after train.py exits for any reason.
+        Logs to /var/log/trainer.log.
+        Updates job_state.json  → status=preempted  (if not already terminal)
+        Updates job_config.json → migration_count++, resume_from_step=last step
     """
     job_id      = job.get("job_id",      "unknown")
     resume_step = job.get("resume_step", 0)
@@ -706,7 +455,7 @@ def _build_training_script(job: dict, decision: dict) -> str:
     aws_secret  = os.getenv("AWS_SECRET_ACCESS_KEY", "")
     aws_region  = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
 
-    # ── Shared header (identical on all clouds) ───────────────────
+    # ── Shared header ─────────────────────────────────────────────
     header = f"""#!/bin/bash
 # startup.sh — {cloud} — generated by scheduler/launcher.py
 # Job: {job_id}  Resume: step {resume_step}
@@ -719,7 +468,6 @@ echo " ML Scheduler — VM Startup ({cloud})"
 echo " $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "=========================================="
 
-# ── Credentials stamped at launch time ───────────────────────────
 export JOB_ID="{job_id}"
 export RESUME_STEP="{resume_step}"
 export PREV_CLOUD="{prev_cloud}"
@@ -744,29 +492,19 @@ fi
 
 if [ -z "${{CHECKPOINT_S3_BUCKET}}" ]; then
   echo "ERROR: CHECKPOINT_S3_BUCKET is empty — cannot download trainer files."
-  echo "       Set CHECKPOINT_S3_BUCKET in your .env before submitting jobs."
   exit 1
 fi
 """
 
     # ── AWS (Amazon Linux 2023) ───────────────────────────────────
-    # Uses dnf (NOT apt-get). awscli v2 is pre-installed as a SYSTEM tool.
-    # CRITICAL: do NOT pip3 install boto3/dateutil at system level — it
-    # overwrites the system python-dateutil that awscli v2 bundles, causing
-    # "ModuleNotFoundError: No module named 'dateutil'" when running `aws`.
-    # Fix: use a virtualenv for all pip installs, keeping system Python clean.
-    # The venv's `aws` binary is NOT used — we use the system awscli (/usr/bin/aws)
-    # which has its own bundled Python and is unaffected by the venv.
     if cloud == "aws":
         pkg_block = """
 echo "==> System packages (Amazon Linux 2023 — dnf)..."
-# python3-venv does NOT exist on AL2023 — venv is built into python3 itself
 dnf install -y -q python3-pip python3 tar gzip
 
 echo "==> Verifying system awscli (pre-installed, must stay untouched)..."
 /usr/local/bin/aws --version || /usr/bin/aws --version
 
-# ── Swap file — t3.small (2GB RAM) needs swap for torch extraction ──
 SWAP_FILE="/swapfile"
 if [ ! -f "$SWAP_FILE" ]; then
   echo "==> Creating 2GB swap file..."
@@ -777,9 +515,6 @@ if [ ! -f "$SWAP_FILE" ]; then
   echo "==> Swap enabled: $(free -h | grep Swap)"
 fi
 
-# ── Virtualenv — isolates pip from system Python ──────────────────
-# This is REQUIRED on Amazon Linux 2023 to avoid breaking awscli.
-# The venv gets boto3/numpy/torch. System Python keeps awscli's deps.
 echo "==> Creating virtualenv /opt/trainer-env (isolated from system pip)..."
 python3 -m venv /opt/trainer-env
 source /opt/trainer-env/bin/activate
@@ -792,17 +527,14 @@ pip install --quiet --no-cache-dir torch==2.2.0 \
     --index-url https://download.pytorch.org/whl/cpu
 echo "==> Deps installed"
 
-# Verify awscli still works after venv activation
 echo "==> Confirming awscli intact after venv: $(/usr/local/bin/aws --version 2>/dev/null || /usr/bin/aws --version)"
 
 PYTHON_CMD="/opt/trainer-env/bin/python3"
 AWS_CMD="/usr/local/bin/aws"
-# Fallback to /usr/bin/aws if v2 not in /usr/local
 [ -f "$AWS_CMD" ] || AWS_CMD="/usr/bin/aws"
 """
 
     # ── GCP / Azure (Ubuntu 22.04) ────────────────────────────────
-    # Uses apt-get. awscli NOT pre-installed — install via apt.
     else:
         pkg_block = """
 echo "==> System packages (Ubuntu 22.04 — apt-get)..."
@@ -812,7 +544,6 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
 
 echo "==> awscli version: $(aws --version)"
 
-# ── Swap file (safety net for e2-standard-2 with 8GB RAM) ────────
 SWAP_FILE="/swapfile"
 if [ ! -f "$SWAP_FILE" ]; then
   echo "==> Creating 2GB swap file..."
@@ -837,15 +568,10 @@ echo "==> Deps installed"
 PYTHON_CMD="python3"
 """
 
-    # ── Shared: download trainer + run + shutdown (all clouds) ────
+    # ── Shared tail: download + run train.py + shutdown hook ──────
+    # NOTE: the shutdown hook Python script uses single-brace {{ }} for
+    # Python dict literals because this is inside an f-string.
     tail = f"""
-if [ -z "${{CHECKPOINT_S3_BUCKET}}" ]; then
-  echo "ERROR: CHECKPOINT_S3_BUCKET is empty — cannot download trainer files."
-  exit 1
-fi
-
-# AWS path sets $AWS_CMD to /usr/local/bin/aws or /usr/bin/aws (system awscli v2)
-# GCP/Azure use plain `aws` (installed via apt-get into PATH)
 AWS_BIN="${{AWS_CMD:-aws}}"
 
 echo ""
@@ -872,34 +598,163 @@ ${{PYTHON_CMD:-python3}} train.py
 EXIT_CODE=$?
 
 echo ""
-[ $EXIT_CODE -eq 0 ] \\
-    && echo "==> Done (exit 0). Shutdown in 60s..." \\
-    || echo "==> Exited ${{EXIT_CODE}}. Shutdown in 60s..."
+echo "=================================================="
+echo " train.py exited with code $EXIT_CODE"
+echo " $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "=================================================="
+[ $EXIT_CODE -eq 0 ] \
+    && echo "==> train.py finished cleanly." \
+    || echo "==> train.py exited with error (code $EXIT_CODE)."
 
-echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') shutdown queued"
-sleep 60
+# ══════════════════════════════════════════════════════════════════
+# SHUTDOWN HOOK — runs after train.py exits for ANY reason
+# Logs to /var/log/trainer.log (same file — exec redirect above)
+# Updates job_state.json  → status=preempted  (if not already terminal)
+# Updates job_config.json → migration_count++, resume_from_step
+# To view: sudo tail -f /var/log/trainer.log
+# ══════════════════════════════════════════════════════════════════
+echo ""
+echo "==> [shutdown-hook] Starting S3 state update..."
+echo "==> [shutdown-hook] JOB_ID=${{JOB_ID}}  CLOUD=${{CLOUD}}  EXIT_CODE=$EXIT_CODE"
+echo "==> [shutdown-hook] CHECKPOINT_S3_BUCKET=${{CHECKPOINT_S3_BUCKET}}"
+
+${{PYTHON_CMD:-python3}} - <<PYEOF
+import os, json, sys, boto3
+from datetime import datetime, timezone
+
+LOG_PREFIX = "[shutdown-hook]"
+bucket     = os.environ.get("CHECKPOINT_S3_BUCKET", "")
+job_id     = os.environ.get("JOB_ID", "")
+cloud      = os.environ.get("CLOUD", "unknown")
+exit_code  = int("$EXIT_CODE") if "$EXIT_CODE".lstrip("-").isdigit() else 1
+
+print(f"{{LOG_PREFIX}} Initialising  bucket={{bucket}}  job_id={{job_id}}  cloud={{cloud}}  exit_code={{exit_code}}")
+
+if not bucket:
+    print(f"{{LOG_PREFIX}} ERROR: CHECKPOINT_S3_BUCKET not set — cannot update S3. Skipping.")
+    sys.exit(0)
+
+if not job_id:
+    print(f"{{LOG_PREFIX}} ERROR: JOB_ID not set — cannot determine S3 paths. Skipping.")
+    sys.exit(0)
+
+# ── S3 client ─────────────────────────────────────────────────────
+try:
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id     = os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        region_name           = os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+    )
+    print(f"{{LOG_PREFIX}} boto3 S3 client created OK")
+except Exception as e:
+    print(f"{{LOG_PREFIX}} ERROR: Failed to create S3 client: {{e}}")
+    sys.exit(0)
+
+def s3_read(key):
+    try:
+        obj  = s3.get_object(Bucket=bucket, Key=key)
+        data = json.loads(obj["Body"].read().decode())
+        print(f"{{LOG_PREFIX}} Read s3://{{bucket}}/{{key}} OK")
+        return data
+    except s3.exceptions.NoSuchKey:
+        print(f"{{LOG_PREFIX}} WARN: s3://{{bucket}}/{{key}} does not exist — returning empty dict")
+        return {{}}
+    except Exception as e:
+        print(f"{{LOG_PREFIX}} WARN: Failed to read s3://{{bucket}}/{{key}}: {{e}}")
+        return {{}}
+
+def s3_write(key, data):
+    try:
+        s3.put_object(
+            Bucket      = bucket,
+            Key         = key,
+            Body        = json.dumps(data, indent=2).encode(),
+            ContentType = "application/json",
+        )
+        print(f"{{LOG_PREFIX}} Wrote s3://{{bucket}}/{{key}} OK")
+        return True
+    except Exception as e:
+        print(f"{{LOG_PREFIX}} ERROR: Failed to write s3://{{bucket}}/{{key}}: {{e}}")
+        return False
+
+now = datetime.now(timezone.utc).isoformat()
+
+# ── Update job_state.json ─────────────────────────────────────────
+state_key = f"checkpoints/{{job_id}}/job_state.json"
+print(f"{{LOG_PREFIX}} Reading job_state.json from {{state_key}} ...")
+state = s3_read(state_key)
+
+TERMINAL_STATUSES = {{"done", "budget_exceeded", "failed", "preempted"}}
+current_status    = state.get("status", "unknown")
+print(f"{{LOG_PREFIX}} Current job_state status = '{{current_status}}'")
+
+if current_status in TERMINAL_STATUSES:
+    print(f"{{LOG_PREFIX}} Status is already terminal ('{{current_status}}') — skipping job_state.json update")
+else:
+    print(f"{{LOG_PREFIX}} Status '{{current_status}}' is not terminal — updating to 'preempted'")
+    state.update({{
+        "status":             "preempted",
+        "cloud":              cloud,
+        "updated_at":         now,
+        "shutdown_exit_code": exit_code,
+        "shutdown_reason":    "vm_shutdown_hook",
+    }})
+    if s3_write(state_key, state):
+        print(f"{{LOG_PREFIX}} job_state.json → status=preempted  exit_code={{exit_code}}")
+    else:
+        print(f"{{LOG_PREFIX}} ERROR: job_state.json update FAILED")
+
+# ── Update job_config.json ────────────────────────────────────────
+config_key = f"checkpoints/{{job_id}}/job_config.json"
+print(f"{{LOG_PREFIX}} Reading job_config.json from {{config_key}} ...")
+config = s3_read(config_key)
+
+if not config:
+    print(f"{{LOG_PREFIX}} WARN: job_config.json not found on S3 — skipping config update")
+else:
+    old_migration = config.get("migration_count", 0)
+    old_step      = config.get("resume_from_step", 0)
+    new_step      = state.get("step", old_step)
+    new_migration = old_migration + 1
+
+    config.update({{
+        "last_cloud":        cloud,
+        "last_shutdown_at":  now,
+        "migration_count":   new_migration,
+        "resume_from_step":  new_step,
+    }})
+    print(f"{{LOG_PREFIX}} job_config.json update: migration_count {{old_migration}} → {{new_migration}},  resume_from_step {{old_step}} → {{new_step}}")
+
+    if s3_write(config_key, config):
+        print(f"{{LOG_PREFIX}} job_config.json updated OK")
+    else:
+        print(f"{{LOG_PREFIX}} ERROR: job_config.json update FAILED")
+
+print(f"{{LOG_PREFIX}} Shutdown hook complete. Handing off to OS shutdown.")
+PYEOF
+
+HOOK_EXIT=$?
+if [ $HOOK_EXIT -eq 0 ]; then
+    echo "==> [shutdown-hook] Completed successfully."
+else
+    echo "==> [shutdown-hook] Exited with code $HOOK_EXIT (non-fatal — VM will still shut down)."
+fi
+
+echo ""
+echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') — shutdown queued (30s delay)"
+sleep 30
 shutdown -h now
 """
 
     return header + pkg_block + tail
 
-    return header + pkg_block + tail
 
+# ══════════════════════════════════════════════════════════════════
+# Checkpoint finder
+# ══════════════════════════════════════════════════════════════════
 
 def _find_latest_checkpoint(job_id: str) -> tuple[Optional[str], int]:
-    """
-    Look for the latest checkpoint on S3 for this job.
-
-    Priority:
-        1. checkpoint_latest.pt  — always written by CheckpointEngine.save()
-        2. step_XXXXXXXX.pt      — milestone saves, use most-recently modified
-
-    Also reads job_state.json on S3 to get the authoritative RESUME_STEP
-    (the step counter train.py was at when it last saved).
-
-    Returns:
-        (s3_path, resume_step)  — s3_path is None if no checkpoint found
-    """
     if not S3_BUCKET:
         logger.warning("[Launcher] CHECKPOINT_S3_BUCKET not set")
         return None, 0
@@ -907,7 +762,6 @@ def _find_latest_checkpoint(job_id: str) -> tuple[Optional[str], int]:
     prefix      = f"checkpoints/{job_id}/"
     resume_step = 0
 
-    # ── Read step from job_state.json ─────────────────────────────
     state = _s3_get_json(f"{prefix}job_state.json")
     if state:
         resume_step = int(state.get("step", 0))
@@ -916,8 +770,7 @@ def _find_latest_checkpoint(job_id: str) -> tuple[Optional[str], int]:
             f"status={state.get('status','?')}"
         )
 
-    # ── Look for checkpoint_latest.pt ─────────────────────────────
-    s3  = _s3_client()
+    s3         = _s3_client()
     latest_key = f"{prefix}checkpoint_latest.pt"
     try:
         s3.head_object(Bucket=S3_BUCKET, Key=latest_key)
@@ -927,7 +780,6 @@ def _find_latest_checkpoint(job_id: str) -> tuple[Optional[str], int]:
     except ClientError:
         pass
 
-    # ── Fall back: most-recent step_*.pt ─────────────────────────
     try:
         resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
         pts  = [o for o in resp.get("Contents", []) if o["Key"].endswith(".pt")]
@@ -947,7 +799,6 @@ def _find_latest_checkpoint(job_id: str) -> tuple[Optional[str], int]:
 # ══════════════════════════════════════════════════════════════════
 
 def _emergency_decision(job: dict) -> dict:
-    """GCP e2-standard-4 spot — CPU, works on free/trial accounts."""
     PRICE    = 0.034
     budget   = float(job.get("max_budget",   2.0))
     deadline = float(job.get("deadline_hrs", 8.0))
@@ -961,11 +812,8 @@ def _emergency_decision(job: dict) -> dict:
         "est_hours":       round(hours, 2),
         "est_cost":        round(hours * PRICE, 4),
         "preemption_risk": 0.05,
-        "gpu_model":       None,
-        "gpu_mem_gb":      0,
-        "gpu_count":       0,
-        "vcpus":           4,
-        "ram_gb":          16,
+        "gpu_model":       None, "gpu_mem_gb": 0, "gpu_count": 0,
+        "vcpus":           4,    "ram_gb":     16,
         "s3_bucket":       S3_BUCKET,
         "reason":          "Emergency fallback — selector unavailable (GCP e2-standard-4 CPU)",
         "pareto_set":      [],
@@ -973,7 +821,6 @@ def _emergency_decision(job: dict) -> dict:
 
 
 def _write_job_state(job_id: str, data: dict):
-    """Local job_state.json write (used by cloud launchers for local tracking)."""
     try:
         path  = Path(JOB_STATE_PATH)
         state = {}
@@ -991,7 +838,6 @@ def _write_job_state(job_id: str, data: dict):
 
 
 def _read_job_state(job_id: str) -> Optional[dict]:
-    """Read from local job_state.json (fallback when S3 unavailable)."""
     try:
         path = Path(JOB_STATE_PATH)
         if not path.exists():

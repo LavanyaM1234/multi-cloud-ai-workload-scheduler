@@ -11,3 +11,5 @@ google-cloud-compute>=1.14
 # trainer/train.py  (installed on VM by startup.sh, not needed locally)
 # torch==2.2.0
 # numpy>=1.24
+
+#when trying to run the same project in vm, need to change path, nd download aws smthg, gcp's nd azure

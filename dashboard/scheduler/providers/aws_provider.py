@@ -319,3 +319,4 @@ def launch_vm(decision: dict, startup_script: str) -> dict:
     """Delegate to aws_launcher.create_aws_vm()."""
     from scheduler.launchers.aws_launcher import create_aws_vm
     return create_aws_vm(decision, startup_script)
+    
