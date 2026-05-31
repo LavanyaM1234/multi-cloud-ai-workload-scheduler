@@ -70,6 +70,27 @@ _GCP_CATALOG: dict[str, tuple] = {
     "g2-standard-8":   (0.270,  8,  32, "L4",   24, 1),
 }
 
+_GCP_ONDEMAND: dict[str, float] = {
+    "e2-standard-2":      0.067,
+    "e2-standard-4":      0.134,
+    "e2-standard-8":      0.268,
+    "e2-standard-16":     0.536,
+    "n1-standard-4":      0.190,
+    "n1-standard-8":      0.380,
+    "n1-standard-16":     0.760,
+    "n1-standard-4+T4":   0.556,
+    "n1-standard-8+T4":   0.746,
+    "n1-standard-8+V100": 2.940,
+    "n1-standard-8+A100": 4.408,
+    "a2-highgpu-1g":      4.408,
+    "a2-highgpu-2g":      8.816,
+    "g2-standard-4":      0.720,
+    "g2-standard-8":      1.440,
+}
+
+# inside candidates.append({...}):
+
+
 # Preemption risk by instance family
 _GCP_RISK: dict[str, float] = {
     "e2-standard-2":      0.05,
@@ -146,6 +167,8 @@ def list_instances() -> list[dict]:
             "is_spot":           True,
             "_price_source":     price_source,
             "_gcp_machine_type": _gcp_machine_type(instance_type),
+            "ondemand_price": _GCP_ONDEMAND.get(instance_type, 0),
+
         })
 
     logger.info(f"[GCP] {len(candidates)} preemptible instances loaded ({price_source} pricing)")

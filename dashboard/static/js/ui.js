@@ -1,25 +1,15 @@
 /**
  * static/js/ui.js
- * ────────────────
- * All DOM manipulation — updates stat cards, price table,
- * job list, event log, numeric cards, and risk bars.
  *
- * Changes from previous version:
- *   - addJob() accepts console_url and renders a "logs" link button
- *   - pollActiveJobs() — calls /api/jobs/status/<id> every 10s
- *     for running jobs so progress updates without waiting 60s
- *   - updateJobFromState() — patches a single job row in-place
- *   - updateRiskBars() — updates risk bar fills + scores + colours
- *     from live LSTM + XGBoost data (/api/risk)
- *   - mergeRealJobs() — keeps locally-submitted jobs that aren't
- *     in GCS yet; maps all GCS statuses to display statuses
- *   - _buildMeta() — builds job meta line from job_state.json fields
- *   - log feed max raised from 20 → 25
- *
- * ui.js knows nothing about fetch or canvas.
- * chart.js knows nothing about the DOM.
- * api.js knows nothing about the DOM or canvas.
- * main.js wires all three together.
+ * Changes vs previous version:
+ *   [1] updateNumericCards() and updateNumericCardsMock() removed —
+ *       replaced by updateHealthStrip() which drives the new cloud
+ *       health strip below the price chart.
+ *   [2] updateStats() now writes to both the stat card (stat-ckpt-total,
+ *       stat-ckpt-emergency) and the jobs panel (ckpt-total, ckpt-emergency)
+ *       to fix the duplicate-ID bug that prevented the stat card from updating.
+ *   [3] updateHealthStrip() computes delta %, volatility label, and
+ *       best-value badge from CHART.getCurrentValues() shape.
  */
 
 const UI = (() => {
@@ -52,42 +42,78 @@ const UI = (() => {
     });
   }
 
-  // ── Numeric cards (below chart) ───────────────────────────────────
-  function updateNumericCards(summary) {
-    if (!summary) return;
-    ['aws', 'gcp', 'azure'].forEach(cloud => {
-      const d = summary[cloud]; if (!d) return;
-      const set = (id, val) => {
-        const el = document.getElementById(id);
-        if (el) el.textContent = '$' + parseFloat(val).toFixed(4);
-      };
-      set(cloud + '-current', d.current_price);
-      set(cloud + '-min',     d.min_price);
-      set(cloud + '-max',     d.max_price);
-      set(cloud + '-avg',     d.avg_price);
-    });
-  }
-
-  // ── Numeric cards from mock chart values ──────────────────────────
-  function updateNumericCardsMock(values) {
-    ['aws', 'gcp', 'azure'].forEach(cloud => {
-      const v = values[cloud]; if (!v) return;
-      const fmt = n => '$' + n.toFixed(4);
-      const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
-      set(cloud + '-current', fmt(v.cur));
-      set(cloud + '-min',     fmt(v.min));
-      set(cloud + '-max',     fmt(v.max));
-      set(cloud + '-avg',     fmt(v.avg));
-      const pEl = document.getElementById(cloud + '-price');
-      const dEl = document.getElementById(cloud + '-delta');
-      if (pEl) pEl.textContent = '$' + v.cur.toFixed(3);
-      if (dEl) {
-        const pct = ((v.cur - v.prev) / v.prev * 100).toFixed(1);
-        dEl.textContent = (pct >= 0 ? '▲ ' : '▼ ') + Math.abs(pct) + '% from last poll';
-        dEl.className   = 'stat-delta ' + (pct >= 0 ? 'delta-up' : 'delta-down');
-      }
-    });
-  }
+  // ── Cloud health strip (below price chart) ────────────────────────
+  /**
+   * Updates the three health cards with current price, delta pill,
+   * sparklines (drawn by CHART.drawSparklines), volatility label,
+   * min/max/avg, and the best-value badge.
+   *
+   * values = CHART.getCurrentValues() — shape:
+   *   { aws, gcp, azure } each with { cur, prev, min, max, avg, series }
+   */
+  function updateHealthStrip(values, apiMeta, summary) {
+  if (!values) return;
+ 
+  const clouds = ['aws', 'gcp', 'azure'];
+  const bestCloud = clouds.reduce((a, b) =>
+    (values[a]?.cur ?? Infinity) < (values[b]?.cur ?? Infinity) ? a : b
+  );
+ 
+  clouds.forEach(cloud => {
+    const v = values[cloud];
+    if (!v) return;
+ 
+    const meta   = apiMeta?.[cloud];
+    const sumRow = summary?.[cloud];          // from /api/prices/summary
+ 
+    // Prefer summary current_price (clean BQ query) over series last value
+    const currentPrice = sumRow?.current_price ?? v.cur;
+    const prevPrice    = v.prev;
+ 
+    const fmt  = n  => '$' + n.toFixed(4);
+    const pct  = ((currentPrice - prevPrice) / (prevPrice || 1) * 100).toFixed(1);
+    const isUp = parseFloat(pct) >= 0;
+ 
+    const set = (id, val) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = val;
+    };
+ 
+    // Instance label from API meta
+    if (meta?.instance) {
+      const cloudNames = { aws: 'AWS', gcp: 'GCP', azure: 'Azure' };
+      const labelEl = document.querySelector(`.${cloud}-hcard .hcard-cloud`);
+      if (labelEl) labelEl.textContent = `${cloudNames[cloud]} · ${meta.instance}`;
+    }
+ 
+    // Current price — 4dp so small moves are visible
+    const curEl = document.getElementById('h' + cloud + '-cur');
+    if (curEl) curEl.textContent = '$' + currentPrice.toFixed(4);
+ 
+    const dEl = document.getElementById('h' + cloud + '-delta');
+    if (dEl) {
+      dEl.textContent = (isUp ? '▲ ' : '▼ ') + Math.abs(pct) + '%';
+      dEl.className   = 'hcard-delta ' + (isUp ? 'up' : 'down');
+    }
+ 
+    // Prefer true historical stats from API over 30-point window
+    const minV = meta?.min ?? sumRow?.min_price ?? v.min;
+    const maxV = meta?.max ?? sumRow?.max_price ?? v.max;
+    const avgV = meta?.avg ?? sumRow?.avg_price ?? v.avg;
+    set('h' + cloud + '-min', fmt(minV));
+    set('h' + cloud + '-max', fmt(maxV));
+    set('h' + cloud + '-avg', fmt(avgV));
+ 
+    const spread   = maxV - minV;
+    const volLabel = spread < 0.015 ? 'Low' : spread < 0.035 ? 'Med' : 'High';
+    const volCls   = spread < 0.015 ? 'vol-low' : spread < 0.035 ? 'vol-med' : 'vol-high';
+    const vEl = document.getElementById('h' + cloud + '-vol');
+    if (vEl) { vEl.textContent = volLabel; vEl.className = 'hcard-vol-val ' + volCls; }
+ 
+    const badge = document.getElementById('best-' + cloud);
+    if (badge) badge.style.display = cloud === bestCloud ? 'inline' : 'none';
+  });
+}
 
   // ── Price table ───────────────────────────────────────────────────
   function updatePriceTable(rows) {
@@ -102,37 +128,89 @@ const UI = (() => {
         <td>${r.gpu_class}</td>
         <td>${r.availability_zone || r.region}</td>
         <td class="price-val ${cls(r.price_usd_per_hr)}">${parseFloat(r.price_usd_per_hr).toFixed(4)}</td>
-        <td>${r.discount_pct ? r.discount_pct.toFixed(0) + '%' : '—'}</td>
+        <td>${r.discount_pct != null ? r.discount_pct.toFixed(0) + '%' : '—'}</td>
       </tr>
     `).join('');
   }
 
   // ── Risk bars ─────────────────────────────────────────────────────
-  /**
-   * Update risk bar fills, scores, and colours from live model data.
-   * riskData: [{cloud, instance_type, region, az, risk: 0.0–1.0}, ...]
-   * Matches against existing .risk-label text (contains instance_type).
-   * Falls back gracefully if panel not in DOM yet.
-   */
-  function updateRiskBars(riskData) {
-    if (!riskData || riskData.length === 0) return;
-    riskData.slice(0, 5).forEach(r => {
-      const items = document.querySelectorAll('.risk-item');
-      items.forEach(item => {
-        const label = item.querySelector('.risk-label')?.textContent || '';
-        if (label.includes(r.instance_type)) {
-          const fill  = item.querySelector('.risk-bar-fill');
-          const score = item.querySelector('.risk-score');
-          if (fill)  fill.style.width  = `${Math.round(r.risk * 100)}%`;
-          if (score) score.textContent = r.risk.toFixed(2);
-          // Update colour class based on threshold
-          item.className = 'risk-item ' +
-            (r.risk < 0.3 ? 'risk-low' :
-             r.risk < 0.6 ? 'risk-med' : 'risk-high');
-        }
-      });
-    });
+function updateRiskBars(riskData) {
+  const panel = document.getElementById('risk-panel-body');
+  if (!panel) return;
+  if (!riskData || !Array.isArray(riskData)) return;  // ← add this line
+
+  const badge = panel.closest('.panel')?.querySelector('.badge');
+
+  if (riskData?.error) {
+    if (badge) { badge.textContent = 'unavailable'; badge.className = 'badge badge-warn'; }
+    panel.innerHTML = `<div style="font-family:var(--font-mono);font-size:11px;
+      color:var(--muted);padding:16px 0;text-align:center">
+      ${riskData.error}<br>
+      <span style="opacity:.6">${riskData.retry_after_seconds
+        ? 'Retrying in ' + riskData.retry_after_seconds + 's…'
+        : 'Will retry on next refresh.'}</span>
+    </div>`;
+    return;
   }
+
+  if (badge) {
+    const now = new Date().toTimeString().slice(0, 5);
+    badge.textContent = 'LSTM + XGBoost · ' + now;
+    badge.className   = 'badge badge-live';
+  }
+
+  if (!riskData || riskData.length === 0) {
+    panel.innerHTML = `<div style="font-family:var(--font-mono);font-size:11px;
+      color:var(--muted);padding:16px 0;text-align:center">
+      No instances to score.</div>`;
+    return;
+  }
+
+  const bars = riskData.map(r => {
+    const pct    = Math.round(r.risk * 100);
+    const cls    = r.risk < 0.3 ? 'risk-low' : r.risk < 0.6 ? 'risk-med' : 'risk-high';
+    const region = r.az || r.region || '';
+    return `
+      <div class="risk-item ${cls}" style="transition:opacity 0.3s">
+        <div class="risk-header">
+          <span class="risk-label">
+            <span class="cloud-tag ${r.cloud}">${r.cloud}</span>
+            ${r.instance_type} · ${region}
+          </span>
+          <span class="risk-score">${r.risk.toFixed(2)}</span>
+        </div>
+        <div class="risk-bar-bg">
+          <div class="risk-bar-fill" style="width:0%;transition:width 0.6s ease"></div>
+        </div>
+      </div>`;
+  }).join('');
+
+  const worst = riskData[0];
+  const best  = [...riskData].sort((a, b) => a.risk - b.risk)[0];
+  const decision = worst.risk >= 0.6 ? `
+    <div class="decision-box">
+      <div class="decision-action migrate">MIGRATE</div>
+      <div class="decision-reason">${worst.instance_type} risk > threshold (0.60)</div>
+      <div class="decision-target">→ move to
+        <span style="color:var(--accent2)">${best.cloud} ${best.instance_type}</span>
+        · risk: ${best.risk.toFixed(2)}
+      </div>
+    </div>` : `
+    <div class="decision-box">
+      <div class="decision-action" style="background:var(--accent)">STABLE</div>
+      <div class="decision-reason">All instances below migration threshold (0.60)</div>
+    </div>`;
+
+  panel.innerHTML = bars + decision;
+
+  // Animate bars in after DOM paint
+  requestAnimationFrame(() => {
+    riskData.forEach((r, i) => {
+      const fills = panel.querySelectorAll('.risk-bar-fill');
+      if (fills[i]) fills[i].style.width = Math.round(r.risk * 100) + '%';
+    });
+  });
+}
 
   // ── Event log ─────────────────────────────────────────────────────
   const LOG_TYPES = {
@@ -163,35 +241,56 @@ const UI = (() => {
     });
   }
 
-  // ── Stats (total rows, preemptions count) ─────────────────────────
-  function updateStats(data) {
+  // ── Stats (total rows / preemptions) ──────────────────────────────
+  /**
+   * Writes to BOTH locations:
+   *   stat-ckpt-total / stat-ckpt-emergency  → top stat card
+   *   ckpt-total / ckpt-emergency            → jobs panel footer
+   *
+   * The old code only wrote to ckpt-total/ckpt-emergency which
+   * are duplicated IDs — getElementById only found the first match
+   * (the jobs panel), so the stat card never updated.
+   */
+  // ui.js — replace updateStats()
+function updateStats(data) {
     if (!data) return;
-    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-    set('ckpt-total',     data.total_rows       || '—');
-    set('ckpt-emergency', data.preemption_count || '0');
-  }
+
+    const set = (id, v) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = v;
+    };
+
+    if (data.error) {
+        addLog('log-warn', `Stats BQ error: ${data.error.slice(0, 80)}`);
+    }
+
+    const total       = data.total_rows       != null ? data.total_rows.toLocaleString() : '—';
+    const preemptions = data.preemption_count != null ? data.preemption_count             : '—';
+
+    set('ckpt-total',     total);
+    set('ckpt-emergency', preemptions);
+}
 
   // ── Jobs list ─────────────────────────────────────────────────────
-  // Empty on load — populated from GCS via mergeRealJobs() on first refresh.
-  // Never seed with hardcoded demo jobs so reload always shows real state.
   let _jobs       = [];
-  let _jobsLoaded = false;   // flips true once first GCS fetch completes
+  let _jobsLoaded = false;
+
+  const ACTIVE_STATUSES   = new Set(['running', 'migrating', 'queued']);
+  const POLLABLE_STATUSES = new Set(['running', 'migrating', 'queued', 'preempted']);
 
   function renderJobs() {
     const el = document.getElementById('jobs-list');
     if (!el) return;
 
-    // Show a loading placeholder until we've heard back from /api/jobs
     if (!_jobsLoaded) {
       el.innerHTML = `<div style="font-family:var(--font-mono);font-size:11px;
         color:var(--muted);padding:16px 0;text-align:center">
-        Loading jobs from GCS…</div>`;
+        Loading jobs from S3…</div>`;
       const badge = document.getElementById('job-count-badge');
       if (badge) badge.textContent = '…';
       return;
     }
 
-    // No jobs at all
     if (_jobs.length === 0) {
       el.innerHTML = `<div style="font-family:var(--font-mono);font-size:11px;
         color:var(--muted);padding:16px 0;text-align:center">
@@ -236,18 +335,16 @@ const UI = (() => {
       </div>
     `).join('');
 
-    const active = _jobs.filter(j =>
-      ['running', 'migrating', 'queued'].includes(j.status)
-    ).length;
-    const badge = document.getElementById('job-count-badge');
+    const active = _jobs.filter(j => ACTIVE_STATUSES.has(j.status)).length;
+    const badge  = document.getElementById('job-count-badge');
     if (badge) badge.textContent = active + ' active';
   }
 
   function pauseJob(i) {
     if (!_jobs[i]) return;
-    _jobs[i].status = _jobs[i].status === 'paused' ? 'running' : 'paused';
-    _jobs[i].meta   = _jobs[i].status === 'paused' ? 'Manually paused' : 'Resumed';
-    addLog('log-warn', `Job ${_jobs[i].id} ${_jobs[i].status}`);
+    const job  = _jobs[i];
+    job.status = job.status === 'paused' ? 'running' : 'paused';
+    addLog('log-warn', `Job ${job.id} ${job.status}`);
     renderJobs();
   }
 
@@ -259,7 +356,6 @@ const UI = (() => {
   }
 
   function addJob(job) {
-    // Avoid duplicates — update in place if already exists
     const existing = _jobs.findIndex(j => j.id === job.id);
     if (existing >= 0) {
       _jobs[existing] = { ..._jobs[existing], ...job };
@@ -270,37 +366,27 @@ const UI = (() => {
     addLog('log-ok', `Job ${job.id} added to dashboard`);
   }
 
-  /**
-   * Update a specific job row with fresh data from job_state.json.
-   * Called by pollActiveJobs() every 10s.
-   * Patches in-place without a full re-render to avoid flicker.
-   */
   function updateJobFromState(state) {
     const i = _jobs.findIndex(j => j.id === state.job_id);
     if (i < 0) return;
 
-    const pct = state.total_epochs
-      ? Math.round((state.epoch / state.total_epochs) * 100)
-      : _jobs[i].pct;
+    const epoch  = state.epoch        ?? 0;
+    const total  = state.total_epochs ?? 50;
+    const pct    = Math.min(99, Math.round((epoch / Math.max(total, 1)) * 100));
 
+    const inst    = state.instance_type || '';
+    const cloud   = state.cloud         || '';
     const costStr = state.cost_usd != null ? ` · $${parseFloat(state.cost_usd).toFixed(3)}` : '';
-    const lossStr = state.loss     != null ? ` · loss ${parseFloat(state.loss).toFixed(4)}` : '';
+    const lossStr = state.loss     != null ? ` · loss ${parseFloat(state.loss).toFixed(4)}`  : '';
 
     _jobs[i].status = state.status || _jobs[i].status;
-    _jobs[i].pct    = Math.min(pct, 99);
-    _jobs[i].meta   =
-      `${state.cloud || 'gcp'} ${state.instance || ''} · ` +
-      `epoch ${state.epoch}/${state.total_epochs}` + lossStr + costStr;
+    _jobs[i].pct    = pct;
+    _jobs[i].meta   = `${cloud} ${inst} · epoch ${epoch}/${total}${lossStr}${costStr}`.trim();
 
     renderJobs();
   }
 
-  /**
-   * Replace job list with live GCS data, keeping locally-submitted
-   * jobs that haven't written a job_state.json to GCS yet.
-   */
   function mergeRealJobs(realJobs) {
-    // Mark loaded even if GCS returned empty — stops the spinner
     _jobsLoaded = true;
 
     if (!realJobs || realJobs.length === 0) {
@@ -308,85 +394,94 @@ const UI = (() => {
       return;
     }
 
-    // Keep locally-submitted jobs (added via modal) that haven't
-    // written job_state.json to GCS yet.
-    // Exclude demo- prefix jobs — they never exist in GCS.
-    const gcsIds    = new Set(realJobs.map(j => j.job_id));
+    const gcsIds    = new Set(realJobs.map(j => j.job_id).filter(Boolean));
     const localOnly = _jobs.filter(j =>
+      j.id && j.id !== 'undefined' &&
       !gcsIds.has(j.id) && !j.id.startsWith('demo-')
     );
 
     const statusMap = {
       running:         'running',
-      queued:          'running',       // show as running while VM boots
+      queued:          'running',
+      launched:        'running',
       migrating:       'migrating',
       paused:          'paused',
       done:            'done',
-      preempted:       'paused',
+      preempted:       'preempted',
       budget_exceeded: 'done',
       launch_failed:   'paused',
+      failed:          'paused',
     };
 
-    const fromGcs = realJobs.map(j => ({
-      id:          j.job_id,
-      name:        j.task_name || j.job_id,
-      meta:        _buildMeta(j),
-      pct:         j.progress_pct ??
-                   Math.min(99, Math.round(((j.epoch || 0) / 50) * 100)),
-      status:      statusMap[j.status] || 'running',
-      cloud:       j.cloud || 'gcp',
-      console_url: j.console_url || '',
-    }));
+    const fromS3 = realJobs
+      .filter(j => j.job_id)
+      .map(j => ({
+        id:          j.job_id,
+        name:        j.task_name || j.job_id,
+        meta:        _buildMeta(j),
+        pct:         j.progress_pct ??
+                     Math.min(99, Math.round(((j.epoch || 0) / Math.max(j.total_epochs || 50, 1)) * 100)),
+        status:      statusMap[j.status] || 'running',
+        cloud:       j.cloud || '',
+        console_url: j.console_url || '',
+      }));
 
-    _jobs = [...fromGcs, ...localOnly];
+    _jobs = [...fromS3, ...localOnly];
     renderJobs();
   }
 
-  /**
-   * Poll active jobs every 10s to get live progress.
-   * Calls /api/jobs/<job_id> for each running/migrating/queued job.
-   * Silently ignores errors — job may not have written state yet.
-   */
-  function pollActiveJobs() {
-    const active = _jobs.filter(j =>
-      ['running', 'migrating', 'queued'].includes(j.status)
+  // ui.js — pollActiveJobs()
+function pollActiveJobs() {
+    const targets = _jobs.filter(j =>
+        j.id &&
+        j.id !== 'undefined' &&
+        !j.id.startsWith('demo-') &&
+        POLLABLE_STATUSES.has(j.status)
     );
-    active.forEach(async job => {
-      try {
-        const resp = await fetch(`/api/jobs/${job.id}`, {
-          signal: AbortSignal.timeout(5000),
-        });
-        if (!resp.ok) return;
-        const state = await resp.json();
-        if (state && !state.error) updateJobFromState(state);
-      } catch (e) {
-        // silently ignore — job may not have written state yet
-      }
+    targets.forEach(async job => {
+        try {
+            const resp = await fetch(`http://localhost:5050/api/jobs/${job.id}`, {
+                signal: AbortSignal.timeout(15_000),   // ← was 5000
+            });
+            if (!resp.ok) return;
+            const state = await resp.json();
+            if (state && !state.error) updateJobFromState(state);
+        } catch (e) {
+            if (e.name !== 'TimeoutError' && e.name !== 'AbortError') {
+                console.warn('[pollActiveJobs]', job.id, e.message);
+            }
+        }
     });
-  }
+}
 
-  // ── Internal helpers ──────────────────────────────────────────────
-
-  /** Build the job meta line from a job_state.json object. */
   function _buildMeta(state) {
     const parts = [];
-    if (state.instance)          parts.push(`GCP ${state.instance}`);
-    if (state.epoch)             parts.push(`epoch ${state.epoch}`);
+    const inst  = state.instance_type
+               || state.launch_result?.instance_type
+               || '';
+    const cloud = state.cloud || state.launch_result?.cloud || '';
+
+    if (inst || cloud)           parts.push(`${cloud} ${inst}`.trim());
+    if (state.epoch != null)     parts.push(`epoch ${state.epoch}/${state.total_epochs ?? '?'}`);
     if (state.step)              parts.push(`step ${state.step}`);
     if (state.loss     != null)  parts.push(`loss ${parseFloat(state.loss).toFixed(4)}`);
     if (state.accuracy != null)  parts.push(`acc ${parseFloat(state.accuracy).toFixed(3)}`);
     if (state.cost_usd != null)  parts.push(`$${parseFloat(state.cost_usd).toFixed(3)}`);
+
     if (state.status === 'done')            parts.push('✓ complete');
     if (state.status === 'preempted')       parts.push('⚡ preempted');
-    if (state.status === 'queued')          parts.push('⏳ VM booting...');
+    if (state.status === 'queued')          parts.push('⏳ VM booting…');
+    if (state.status === 'launched')        parts.push('⏳ VM booting…');
     if (state.status === 'budget_exceeded') parts.push('⚠ budget limit');
-    return parts.join(' · ') || state.status;
+    if (state.status === 'failed')          parts.push('✗ failed');
+
+    return parts.join(' · ') || state.status || '—';
   }
 
-  // ── Public API ────────────────────────────────────────────────────
   return {
     startClock,
-    updateStatCards, updateNumericCards, updateNumericCardsMock,
+    updateStatCards,
+    updateHealthStrip,
     updatePriceTable,
     updateRiskBars,
     addLog, addPreemptionLogs,

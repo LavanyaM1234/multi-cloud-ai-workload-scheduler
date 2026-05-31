@@ -45,10 +45,12 @@ from scheduler.selector import pick_best_cloud
 
 logger = logging.getLogger(__name__)
 
+load_dotenv("credentials.env")
+
 # ── Env ───────────────────────────────────────────────────────────
-JOB_STATE_PATH = os.getenv("JOB_STATE_PATH",        "job_state.json")
+JOB_STATE_PATH = os.getenv("JOB_STATE_PATH",        "")
 S3_BUCKET      = os.getenv("CHECKPOINT_S3_BUCKET",  "")
-GCS_BUCKET     = os.getenv("CHECKPOINT_GCS_BUCKET", "")
+GCS_BUCKET     = os.getenv("CHECKPOINT_GCS_BUCKET", "ml-scheduler-jobs-tensile-method-459009-k2")
 
 _FALLBACK_CHAIN = ["aws", "azure", "gcp"]
 

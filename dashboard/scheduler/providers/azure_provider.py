@@ -81,6 +81,21 @@ _LOCATION_TO_REGION = {
     "japaneast":     "japaneast",
 }
 
+_AZURE_ONDEMAND: dict[str, float] = {
+    "Standard_D2s_v3":       0.096,
+    "Standard_D4s_v3":       0.192,
+    "Standard_D8s_v3":       0.384,
+    "Standard_D16s_v3":      0.768,
+    "Standard_F4s_v2":       0.169,
+    "Standard_F8s_v2":       0.338,
+    "Standard_NC4as_T4_v3":  0.526,
+    "Standard_NC8as_T4_v3":  1.052,
+    "Standard_NC16as_T4_v3": 2.104,
+    "Standard_NC6s_v3":      3.024,
+    "Standard_NC12s_v3":     6.048,
+    "Standard_ND96asr_v4":   27.197,
+}
+
 
 def _fetch_live_spot_prices(instance_types: list[str]) -> dict[str, float]:
     """
@@ -152,6 +167,7 @@ def list_instances() -> list[dict]:
             "ram_gb":          ram_gb,
             "is_spot":         True,
             "_price_source":   price_source,
+            "ondemand_price": _AZURE_ONDEMAND.get(instance_type, 0),
         })
 
     logger.info(f"[Azure] {len(candidates)} spot instances loaded ({price_source} pricing)")

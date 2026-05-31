@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 from risk.predictor import score_instance_from_api
 
 AWS_REGION     = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-AWS_ENABLE_GPU = os.getenv("AWS_ENABLE_GPU", "false").lower() == "true"
+AWS_ENABLE_GPU = "true"
 
 # ── Instance catalog ─────────────────────────────────────────────
 # Format: instance_type → (spot_fallback_price, vcpus, ram_gb, gpu_model, gpu_mem_gb, gpu_count)
@@ -252,6 +252,7 @@ def list_instances() -> list[dict]:
             "ram_gb":        spec.get("ram_gb",      cat_ram),
             "is_spot":       True,
             "_price_source": price_source,
+            "ondemand_price": _ONDEMAND_PRICES.get(instance_type, 0),
         })
 
     logger.info(

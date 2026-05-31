@@ -1,0 +1,21 @@
+{
+  "job_id": "fake-train-1780075882",
+  "task_name": "Untitled",
+  "lr": 0.001,
+  "hidden_dim": 256,
+  "dropout": 0.3,
+  "batch_size": 64,
+  "epochs": 50,
+  "ckpt_every": 50,
+  "input_dim": 50,
+  "num_classes": 5,
+  "max_budget": 2.0,
+  "dataset_type": "synthetic-500k",
+  "s3_dataset_path": "",
+  "price_usd_hr": 0.0083,
+  "instance_type": "t3.small",
+  "cloud": "aws",
+  "resume_from_step": 0,
+  "migration_count": 0,
+  "gcs_bucket": ""
+}

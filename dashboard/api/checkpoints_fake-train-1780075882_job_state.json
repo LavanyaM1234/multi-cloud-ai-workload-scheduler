@@ -1,0 +1,5 @@
+{
+  "status": "launch_failed",
+  "error": "[Launcher] All launch attempts failed (['aws', 'azure', 'gcp'] + on-demand): GCP_PROJECT_ID env var not set",
+  "updated_at": "2026-05-29T17:37:33.363186+00:00"
+}

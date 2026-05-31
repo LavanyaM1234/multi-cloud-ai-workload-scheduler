@@ -1,45 +1,33 @@
 /**
  * static/js/api.js
- * ─────────────────
- * All network calls to the Flask backend (api/server.py).
  *
- * Change API_BASE to your Flask server's address:
- *   - Local:  "http://localhost:5050"
- *   - VM:     "http://<ORCHESTRATOR_VM_IP>:5050"
- *
- * Changes from previous version:
- *   - riskScores() added — calls /api/risk (LSTM + XGBoost scores)
- *   - refreshAll() includes riskScores() in Promise.all
- *   - _post() timeout increased to 30s for job submit
- *     (VM creation is non-blocking now but keeps headroom)
+
  */
 
 const API = (() => {
-  // ── Config ────────────────────────────────────────────────────────
-  const BASE           = 'http://localhost:5050';
-  const TIMEOUT        = 6000;   // ms — for GET requests
-  const SUBMIT_TIMEOUT = 30000;  // ms — for POST /api/jobs/submit
+  const BASE            = 'http://localhost:5050';
+  const TIMEOUT         = 12000;
+  const RISK_TIMEOUT    = 300_000;
+  const JOBS_TIMEOUT = 300_000;
+  const SUBMIT_TIMEOUT  = 30000;
+  const HISTORY_TIMEOUT = 30_000;
 
-  let _useMock = true;   // flips to false when first real response arrives
-  let _lastOk  = null;   // timestamp of last successful API call
+  let _useMock     = true;
+  let _wasEverLive = false;
+  let _lastOk      = null;
 
-  // ── Internal fetch helpers ────────────────────────────────────────
-
-  async function _get(path) {
+  async function _get(path, timeout = TIMEOUT) {
     try {
       const res = await fetch(BASE + path, {
-        signal: AbortSignal.timeout(TIMEOUT),
+        signal: AbortSignal.timeout(timeout),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      _lastOk  = new Date();
-      _useMock = false;
-      _setStatus(true, 'Connected — live BigQuery data');
+      const data   = await res.json();
+      _lastOk      = new Date();
+      _useMock     = false;
+      _wasEverLive = true;
       return data;
     } catch (e) {
-      if (!_useMock) {
-        _setStatus(false, `API unreachable: ${e.message}`);
-      }
       return null;
     }
   }
@@ -59,70 +47,62 @@ const API = (() => {
     }
   }
 
-  // ── Status badge ──────────────────────────────────────────────────
-
-  function _setStatus(ok, msg) {
+  function _setStatus(state, msg) {
     const el = document.getElementById('api-status-badge');
     if (!el) return;
-    el.textContent = ok ? 'LIVE DATA' : 'MOCK DATA';
-    el.className   = 'badge ' + (ok ? 'badge-live' : 'badge-mock');
-    el.title       = msg;
+    if (state === 'live')  { el.textContent = 'LIVE DATA';    el.className = 'badge badge-live'; }
+    if (state === 'stale') { el.textContent = 'RECONNECTING'; el.className = 'badge badge-warn'; }
+    if (state === 'mock')  { el.textContent = 'MOCK DATA';    el.className = 'badge badge-mock'; }
+    el.title = msg;
   }
 
-  // ── Endpoints ─────────────────────────────────────────────────────
-
-  /** 30-point price time series per cloud */
-  const priceHistory = () => _get('/api/prices/history');
-
-  /** min/max/avg/current per cloud over last 3 hours */
+  const priceHistory = () => _get('/api/prices/history', HISTORY_TIMEOUT);
   const priceSummary = () => _get('/api/prices/summary');
-
-  /** latest price row per instance type */
   const latestPrices = () => _get('/api/prices/latest');
-
-  /** recent preempted=TRUE rows from BigQuery */
   const preemptions  = () => _get('/api/prices/preemptions');
-
-  /** active jobs from GCS job_state.json files */
-  const jobs         = () => _get('/api/jobs');
-
-  /** high-level stats (total rows, preemption count) */
+  const jobs         = () => _get('/api/jobs', JOBS_TIMEOUT);
   const stats        = () => _get('/api/stats');
-
-  /** health check — BigQuery reachable? */
   const health       = () => _get('/api/health');
-
-  /** submit job to scheduler — returns immediately, VM created in background */
   const submitJob    = body => _post('/api/jobs/submit', body);
+  const riskScores   = () => _get('/api/risk', RISK_TIMEOUT);
+  const fetchRisk    = () => _get('/api/risk', RISK_TIMEOUT);
+  const fetchPareto = () => _get('/api/pareto', 300_000);  // 5 min, same as cache TTL
 
-  /**
-   * Preemption risk scores from LSTM + XGBoost model.
-   * Returns list of {cloud, instance_type, region, az, risk: 0.0–1.0}
-   * Falls back to null if /api/risk not yet available (model not loaded).
-   */
-  const riskScores   = () => _get('/api/risk');
-
-  /**
-   * Fetch everything at once — called every 60s by main.js refresh().
-   * risk is included so the risk bars update on every full refresh.
-   */
   async function refreshAll() {
-    const [history, summary, latest, preemptionList, statData, risk] =
+    const [history, summary, latest, preemptionList, statData, realJobs] =
       await Promise.all([
         priceHistory(),
         priceSummary(),
         latestPrices(),
         preemptions(),
         stats(),
-        riskScores(),   // ← LSTM + XGBoost preemption risk scores
+        jobs(),
       ]);
-    return { history, summary, latest, preemptionList, statData, risk };
+
+    const results   = [history, summary, latest, preemptionList, statData, realJobs];
+    const anyOk     = results.some(r => r !== null);
+    const allFailed = results.every(r => r === null);
+
+    if (anyOk) {
+      _useMock     = false;
+      _wasEverLive = true;
+      _lastOk      = new Date();
+      _setStatus('live', 'Connected — live data');
+    } else if (allFailed && _wasEverLive) {
+      _setStatus('stale', 'Reconnecting…');
+    } else if (allFailed) {
+      _useMock = true;
+      _setStatus('mock', 'API unreachable — using mock data');
+    }
+
+    return { history, summary, latest, preemptionList, statData, realJobs };
   }
 
   return {
     priceHistory, priceSummary, latestPrices, preemptions,
-    jobs, stats, health, submitJob, riskScores, refreshAll,
-    isLive: () => !_useMock,
-    lastOk: () => _lastOk,
+    jobs, stats, health, submitJob, riskScores, fetchRisk, fetchPareto, refreshAll,
+    isLive:      () => !_useMock,
+    wasEverLive: () => _wasEverLive,
+    lastOk:      () => _lastOk,
   };
 })();

@@ -388,45 +388,70 @@ def _fetch_live_prices(cloud: str, region: str, az: str,
 
         ec2 = boto3.client("ec2", region_name=region)
 
-        if not az:
-            zones_resp = ec2.describe_availability_zones(
-                Filters=[{"Name": "region-name", "Values": [region]}]
-            )
-            zones = [
-                z["ZoneName"]
-                for z in zones_resp["AvailabilityZones"]
-                if z["State"] == "available"
-            ]
-            az = zones[0] if zones else None
-            print(f"[risk]   Auto-selected AZ: {az}")
+        # Try multiple instance types — GPU instances may not be available
+        instance_types_to_try = [instance_type] + [
+            t for t in ["g4dn.xlarge", "t3.medium", "t3.small", "m5.large"]
+            if t != instance_type
+        ]
 
-        params = {
-            "InstanceTypes":       [instance_type],
-            "ProductDescriptions": ["Linux/UNIX"],
-            "StartTime":           datetime.now(timezone.utc) - timedelta(hours=1080),
-            "MaxResults":          100,
-        }
-        if az:
-            params["AvailabilityZone"] = az
+        resp_entries  = []
+        used_instance = instance_type
 
-        resp = ec2.describe_spot_price_history(**params)
-        print(f"[risk]   Retrieved {len(resp.get('SpotPriceHistory', []))} spot records")
+        for itype in instance_types_to_try:
+            params = {
+                "InstanceTypes":       [itype],
+                "ProductDescriptions": ["Linux/UNIX"],
+                "StartTime":           datetime.now(timezone.utc) - timedelta(hours=1080),
+                "MaxResults":          100,
+                # No AvailabilityZone filter — cast wide net
+            }
+            resp    = ec2.describe_spot_price_history(**params)
+            entries = resp.get("SpotPriceHistory", [])
+            print(f"[risk]   AWS tried {itype}: {len(entries)} records")
+            if entries:
+                resp_entries  = entries
+                used_instance = itype
+                break
 
-        for entry in resp.get("SpotPriceHistory", []):
-            rows.append({
-                "price_usd_per_hr":      float(entry["SpotPrice"]),
-                "ondemand_price_usd_hr": _get_aws_ondemand(instance_type),
-                "gpu_count":             0,
-                "vcpu_count":            0,
-                "ram_gb":                0.0,
-                "cloud":                 "aws",
-                "region":                region,
-                "availability_zone":     entry.get("AvailabilityZone", az),
-                "instance_type":         instance_type,
-                "gpu_class":             "none",
-                "preempted":             False,
-                "collected_at":          entry["Timestamp"],
-            })
+        if not resp_entries:
+            print(f"[risk]   AWS no records found — using synthetic fallback")
+            import random
+            base = _get_aws_ondemand(instance_type) * 0.3
+            now  = pd.Timestamp.now(tz="UTC")
+            cur  = base
+            for i in range(SEQUENCE_LEN + 10):
+                step = random.uniform(-0.005, 0.005)
+                cur  = round(max(base * 0.8, min(base * 1.2, cur + step)), 4)
+                rows.append({
+                    "price_usd_per_hr":      cur,
+                    "ondemand_price_usd_hr": _get_aws_ondemand(instance_type),
+                    "gpu_count":             0,
+                    "vcpu_count":            0,
+                    "ram_gb":                0.0,
+                    "cloud":                 "aws",
+                    "region":                region,
+                    "availability_zone":     az or f"{region}a",
+                    "instance_type":         instance_type,
+                    "gpu_class":             "none",
+                    "preempted":             False,
+                    "collected_at":          now - pd.Timedelta(minutes=i),
+                })
+        else:
+            for entry in resp_entries:
+                rows.append({
+                    "price_usd_per_hr":      float(entry["SpotPrice"]),
+                    "ondemand_price_usd_hr": _get_aws_ondemand(used_instance),
+                    "gpu_count":             0,
+                    "vcpu_count":            0,
+                    "ram_gb":                0.0,
+                    "cloud":                 "aws",
+                    "region":                region,
+                    "availability_zone":     entry.get("AvailabilityZone", az),
+                    "instance_type":         used_instance,
+                    "gpu_class":             "none",
+                    "preempted":             False,
+                    "collected_at":          entry["Timestamp"],
+                })
 
     elif cloud == "gcp":
         import random
@@ -452,9 +477,14 @@ def _fetch_live_prices(cloud: str, region: str, az: str,
     elif cloud == "azure":
         price = _get_azure_spot_price(instance_type, region)
         now   = pd.Timestamp.now(tz="UTC")
+        import random
+        current = price
         for i in range(SEQUENCE_LEN + 10):
+            # Small random walk anchored to real price — stays within ±4%
+            step    = random.uniform(-0.003, 0.003)
+            current = round(max(price * 0.96, min(price * 1.04, current + step)), 4)
             rows.append({
-                "price_usd_per_hr":      price,
+                "price_usd_per_hr":      current,
                 "ondemand_price_usd_hr": price * 3,
                 "gpu_count":             0,
                 "vcpu_count":            0,
@@ -503,6 +533,7 @@ def _get_azure_spot_price(instance_type: str, region: str) -> float:
     try:
         import requests
         url    = "https://prices.azure.com/api/retail/prices"
+        # armSkuName uses the exact instance type name
         params = {
             "$filter": (
                 f"serviceName eq 'Virtual Machines' and "
@@ -514,14 +545,23 @@ def _get_azure_spot_price(instance_type: str, region: str) -> float:
         resp  = requests.get(url, params=params, timeout=5)
         items = resp.json().get("Items", [])
         if items:
-            return float(items[0]["retailPrice"])
-    except Exception:
-        pass
+            price = float(items[0]["retailPrice"])
+            print(f"[risk]   Azure live price {instance_type}: ${price}/hr")
+            return price
+    except Exception as e:
+        print(f"[risk]   Azure price fetch failed: {e}")
+
     fallbacks = {
-        "Standard_NC4as_T4_v3": 0.21,
-        "Standard_NC8as_T4_v3": 0.36,
+        "Standard_NC4as_T4_v3":  0.21,
+        "Standard_NC8as_T4_v3":  0.36,
+        "Standard_NC16as_T4_v3": 0.72,
+        "Standard_NC6s_v3":      0.90,
+        "Standard_D2s_v3":       0.024,
+        "Standard_D4s_v3":       0.048,
     }
-    return fallbacks.get(instance_type, 0.15)
+    fallback = fallbacks.get(instance_type, 0.15)
+    print(f"[risk]   Azure using fallback price {instance_type}: ${fallback}/hr")
+    return fallback
 
 
 def _fetch_bq_fallback(cloud: str, region: str, az: str,
